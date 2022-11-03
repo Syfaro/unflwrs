@@ -15,7 +15,7 @@
             <span class="relative-time" data-timestamp="{{ last_updated.timestamp() }}">{{ last_updated }}</span>
         </h2>
         {% else %}
-        <h2>waiting for first update</h2>
+        <h2 data-missing="yes">waiting for first update</h2>
         {% endmatch %}
     </hgroup>
 
