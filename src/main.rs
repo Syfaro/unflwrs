@@ -389,9 +389,10 @@ struct FeedTemplate {
 
 #[get("/feed")]
 async fn feed(cx: web::Data<Context>, sess: Session) -> Result<HttpResponse, actix_web::Error> {
-    let user_id: i64 = sess
-        .get("twitter-user-id")?
-        .ok_or_else(|| actix_web::error::ErrorUnauthorized("missing id"))?;
+    let Some(user_id) = sess
+        .get::<i64>("twitter-user-id")? else {
+            return Ok(HttpResponse::Found().insert_header(("location", "/")).finish())
+        };
 
     let csrf_token: String = sess.get("csrf-token")?.ok_or_else(|| {
         sess.clear();
