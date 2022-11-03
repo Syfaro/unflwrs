@@ -20,6 +20,50 @@
     },
     "query": "SELECT id FROM twitter_account WHERE id = ANY($1) AND last_updated > now() - interval '7 day'"
   },
+  "239d3e4570fb03afd0e07a3c47d701bdc889aeb24e9b2cda2a797dbc741f7a10": {
+    "describe": {
+      "columns": [
+        {
+          "name": "created_at",
+          "ordinal": 0,
+          "type_info": "Timestamptz"
+        },
+        {
+          "name": "event_name",
+          "ordinal": 1,
+          "type_info": "Text"
+        },
+        {
+          "name": "id",
+          "ordinal": 2,
+          "type_info": "Int8"
+        },
+        {
+          "name": "screen_name",
+          "ordinal": 3,
+          "type_info": "Text"
+        },
+        {
+          "name": "display_name",
+          "ordinal": 4,
+          "type_info": "Text"
+        }
+      ],
+      "nullable": [
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      "parameters": {
+        "Left": [
+          "Int8"
+        ]
+      }
+    },
+    "query": "SELECT twitter_event.created_at, twitter_event.event_name, twitter_account.id, twitter_account.screen_name, twitter_account.display_name FROM twitter_event JOIN twitter_account ON twitter_account.id = twitter_event.related_twitter_account_id WHERE login_twitter_account_id = $1 ORDER BY created_at"
+  },
   "3f156606e0ac2eb546d56f1f164e80778649dff395733bf8e1849c08b5893bc0": {
     "describe": {
       "columns": [
@@ -103,6 +147,18 @@
       }
     },
     "query": "SELECT follower_ids FROM twitter_state WHERE login_twitter_account_id = $1 ORDER BY created_at DESC LIMIT 1"
+  },
+  "7efea2c61ea2da5e4601da4d0f104771a0b5adeab03d3fa8409c659c37080e34": {
+    "describe": {
+      "columns": [],
+      "nullable": [],
+      "parameters": {
+        "Left": [
+          "Int8"
+        ]
+      }
+    },
+    "query": "DELETE FROM twitter_login WHERE twitter_account_id = $1"
   },
   "8392f1b4a9ae39df42c4184d84b27313c612234c328df8490e3356bcf705bc41": {
     "describe": {

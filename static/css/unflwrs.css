@@ -3,3 +3,8 @@
     color: white;
   }
 }
+
+.delete[role="button"] {
+  color: var(--del-color);
+  border-color: var(--del-color);
+}

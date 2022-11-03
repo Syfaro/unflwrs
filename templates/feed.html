@@ -1,5 +1,9 @@
 {% extends "base.html" %}
 
+{% block header %}
+    <meta name="csrf-token" value="{{ csrf_token }}">
+{% endblock %}
+
 {% block content %}
 <header class="container">
     <hgroup>
@@ -14,6 +18,9 @@
         <h2>waiting for first update</h2>
         {% endmatch %}
     </hgroup>
+
+    <a href="/export/csv" role="button" class="outline">export csv</a>
+    <a href="#" role="button" class="delete outline" id="delete-account">delete my data</a>
 
     <div class="ct-chart"></div>
 </header>

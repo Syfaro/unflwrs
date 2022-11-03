@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use actix_session::{storage::CookieSessionStore, Session, SessionMiddleware};
 use actix_web::{get, post, web, App, HttpResponse, HttpServer};
 use askama::Template;
+use bytes::Bytes;
 use clap::Parser;
 use futures::{StreamExt, TryStreamExt};
 use serde::Deserialize;
@@ -73,6 +74,8 @@ async fn main() {
             .service(twitter_callback)
             .service(feed)
             .service(feed_graph)
+            .service(export_csv)
+            .service(account_delete)
             .service(actix_files::Files::new("/static", "./static"))
             .app_data(web::Data::new(cx))
     })
@@ -273,6 +276,16 @@ struct TwitterCallbackQuery {
     oauth_verifier: String,
 }
 
+fn generate_token(n: usize) -> String {
+    use rand::Rng;
+
+    rand::thread_rng()
+        .sample_iter(&rand::distributions::Alphanumeric)
+        .take(n)
+        .map(char::from)
+        .collect()
+}
+
 #[get("/twitter/callback")]
 async fn twitter_callback(
     cx: web::Data<Context>,
@@ -316,6 +329,7 @@ async fn twitter_callback(
     ).execute(&cx.pool).await.map_err(actix_web::error::ErrorInternalServerError)?;
 
     sess.insert("twitter-user-id", user_id)?;
+    sess.insert("csrf-token", generate_token(48))?;
 
     tokio::task::spawn(async move {
         if let Err(err) = refresh_account(cx.pool.clone(), user_id, token).await {
@@ -328,12 +342,15 @@ async fn twitter_callback(
         .finish())
 }
 
+#[allow(dead_code)]
+#[derive(Debug)]
 struct TwitterUser {
     id: i64,
     screen_name: String,
     display_name: String,
 }
 
+#[derive(Debug)]
 enum TwitterEvent {
     Follow,
     Unfollow,
@@ -348,6 +365,7 @@ impl std::fmt::Display for TwitterEvent {
     }
 }
 
+#[derive(Debug)]
 struct TwitterEventEntry {
     user: TwitterUser,
     event: TwitterEvent,
@@ -360,6 +378,7 @@ struct FeedTemplate {
     user: TwitterUser,
     events: Vec<TwitterEventEntry>,
     last_updated: Option<chrono::DateTime<chrono::Utc>>,
+    csrf_token: String,
 }
 
 #[get("/feed")]
@@ -367,6 +386,10 @@ async fn feed(cx: web::Data<Context>, sess: Session) -> Result<HttpResponse, act
     let user_id: i64 = sess
         .get("twitter-user-id")?
         .ok_or_else(|| actix_web::error::ErrorUnauthorized("missing id"))?;
+
+    let csrf_token: String = sess
+        .get("csrf-token")?
+        .ok_or_else(|| actix_web::error::ErrorUnauthorized("missing token"))?;
 
     let user = sqlx::query_as!(
         TwitterUser,
@@ -404,6 +427,7 @@ async fn feed(cx: web::Data<Context>, sess: Session) -> Result<HttpResponse, act
         user,
         events,
         last_updated,
+        csrf_token,
     }
     .render()
     .map_err(actix_web::error::ErrorInternalServerError)?;
@@ -429,4 +453,90 @@ async fn feed_graph(
     .map_err(actix_web::error::ErrorInternalServerError)?;
 
     Ok(web::Json(entries))
+}
+
+#[get("/export/csv")]
+async fn export_csv(
+    cx: web::Data<Context>,
+    sess: Session,
+) -> Result<HttpResponse, actix_web::Error> {
+    let user_id: i64 = sess
+        .get("twitter-user-id")?
+        .ok_or_else(|| actix_web::error::ErrorUnauthorized("missing id"))?;
+
+    tracing::info!("starting csv export");
+
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+
+    tokio::task::spawn(async move {
+        let mut events = sqlx::query!("SELECT twitter_event.created_at, twitter_event.event_name, twitter_account.id, twitter_account.screen_name, twitter_account.display_name FROM twitter_event JOIN twitter_account ON twitter_account.id = twitter_event.related_twitter_account_id WHERE login_twitter_account_id = $1 ORDER BY created_at", user_id).map(|row| TwitterEventEntry {
+            user: TwitterUser {
+                id: row.id,
+                screen_name: row.screen_name,
+                display_name: row.display_name,
+            },
+            event: match row.event_name.as_ref() {
+                "follow" => TwitterEvent::Follow,
+                "unfollow" => TwitterEvent::Unfollow,
+                _ => unreachable!(),
+            },
+            created_at: row.created_at,
+        }).fetch(&cx.pool);
+
+        while let Some(Ok(event)) = events.next().await {
+            tx.send(event).await.unwrap();
+        }
+    });
+
+    let stream = tokio_stream::wrappers::ReceiverStream::from(rx).map(|event| {
+        Ok::<_, std::convert::Infallible>(Bytes::from(format!(
+            "{},{},{},{}\n",
+            event.created_at.to_rfc3339(),
+            event.event,
+            event.user.id,
+            event.user.screen_name
+        )))
+    });
+
+    Ok(HttpResponse::Ok()
+        .content_type("text/csv")
+        .streaming(stream))
+}
+
+#[derive(Deserialize)]
+struct AccountDeleteForm {
+    csrf: String,
+}
+
+#[post("/account/delete")]
+async fn account_delete(
+    cx: web::Data<Context>,
+    sess: Session,
+    form: web::Form<AccountDeleteForm>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let user_id: i64 = sess
+        .get("twitter-user-id")?
+        .ok_or_else(|| actix_web::error::ErrorUnauthorized("missing id"))?;
+
+    let csrf_token: String = sess
+        .get("csrf-token")?
+        .ok_or_else(|| actix_web::error::ErrorUnauthorized("missing token"))?;
+
+    if form.csrf != csrf_token {
+        return Err(actix_web::error::ErrorUnauthorized("bad csrf token"));
+    }
+
+    sqlx::query!(
+        "DELETE FROM twitter_login WHERE twitter_account_id = $1",
+        user_id
+    )
+    .execute(&cx.pool)
+    .await
+    .map_err(actix_web::error::ErrorInternalServerError)?;
+
+    sess.clear();
+
+    Ok(HttpResponse::Found()
+        .insert_header(("location", "/"))
+        .finish())
 }

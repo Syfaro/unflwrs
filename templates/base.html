@@ -7,9 +7,11 @@
 
     <title>unflwrs</title>
 
-    <link rel="stylesheet" href="/static/css/pico.css">
-    <link rel="stylesheet" href="/static/css/chartist.min.css">
-    <link rel="stylesheet" href="/static/css/unflwrs.css">
+    <link rel="stylesheet" href="/static/css/pico.css?{{ env!("CARGO_PKG_VERSION") }}">
+    <link rel="stylesheet" href="/static/css/chartist.min.css?{{ env!("CARGO_PKG_VERSION") }}">
+    <link rel="stylesheet" href="/static/css/unflwrs.css?{{ env!("CARGO_PKG_VERSION") }}">
+
+    {% block header %}{% endblock %}
 </head>
 
 <body>
@@ -17,10 +19,11 @@
 
     <footer class="container">
         <p>a project by <a href="https://syfaro.net">syfaro</a></p>
+        <p>v{{ env!("CARGO_PKG_VERSION") }}</p>
     </footer>
 
-    <script src="/static/js/chartist.min.js"></script>
-    <script src="/static/js/unflwrs.js"></script>
+    <script src="/static/js/chartist.min.js?{{ env!("CARGO_PKG_VERSION") }}"></script>
+    <script src="/static/js/unflwrs.js?{{ env!("CARGO_PKG_VERSION") }}"></script>
 </body>
 
 </html>

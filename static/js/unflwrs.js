@@ -87,3 +87,33 @@ async function displayGraph() {
     }
   })
 }
+
+const deleteAccountBtn = document.getElementById('delete-account');
+if (deleteAccountBtn) {
+  deleteAccountBtn.addEventListener('click', (ev) => {
+    ev.preventDefault();
+    deleteAccountBtn.setAttribute('aria-busy', true);
+
+    if (confirm('Are you sure? This will immediately remove all your data.')) {
+      const csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('value');
+
+      fetch('/account/delete', {
+        method: 'post',
+        body: new URLSearchParams({
+          'csrf': csrfToken,
+        }),
+        headers: {
+          'content-type': 'application/x-www-form-urlencoded'
+        }
+      }).then(() => {
+        window.location.href = '/';
+      }).catch((err) => {
+        console.error(err);
+        alert('Could not delete account.');
+        deleteAccountBtn.removeAttribute('aria-busy');
+      });
+    } else {
+      deleteAccountBtn.removeAttribute('aria-busy');
+    }
+  })
+}
