@@ -45,9 +45,9 @@ if (document.querySelector('h2[data-missing="yes"]')) {
   }, 60 * 1000);
 }
 
-if (document.querySelector('main[data-page="feed"]')) {
-  displayGraph().then(() => console.log('Updated graph'));
-}
+// if (document.querySelector('main[data-page="feed"]')) {
+//   displayGraph().then(() => console.log('Updated graph'));
+// }
 
 async function displayGraph() {
   const resp = await fetch('/feed/graph');
