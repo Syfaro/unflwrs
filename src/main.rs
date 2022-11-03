@@ -247,7 +247,13 @@ async fn refresh_accounts(pool: &sqlx::PgPool, kp: &egg_mode::KeyPair) -> Result
 struct HomeTemplate;
 
 #[get("/")]
-async fn home() -> Result<actix_web::HttpResponse, AppError> {
+async fn home(sess: Session) -> Result<actix_web::HttpResponse, AppError> {
+    if matches!(sess.get::<i64>("twitter-user-id"), Ok(Some(_))) {
+        return Ok(HttpResponse::Found()
+            .insert_header(("location", "/feed"))
+            .finish());
+    }
+
     let body = HomeTemplate.render()?;
     Ok(actix_web::HttpResponse::Ok()
         .content_type("text/html")
@@ -387,9 +393,10 @@ async fn feed(cx: web::Data<Context>, sess: Session) -> Result<HttpResponse, act
         .get("twitter-user-id")?
         .ok_or_else(|| actix_web::error::ErrorUnauthorized("missing id"))?;
 
-    let csrf_token: String = sess
-        .get("csrf-token")?
-        .ok_or_else(|| actix_web::error::ErrorUnauthorized("missing token"))?;
+    let csrf_token: String = sess.get("csrf-token")?.ok_or_else(|| {
+        sess.clear();
+        actix_web::error::ErrorUnauthorized("missing token")
+    })?;
 
     let user = sqlx::query_as!(
         TwitterUser,
