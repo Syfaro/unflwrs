@@ -13,7 +13,7 @@ askama = "0.11.1"
 chrono = "0.4.22"
 clap = { version = "4.0.18", features = ["derive", "env"] }
 dotenvy = "0.15.6"
-egg-mode = "0.16.0"
+egg-mode = { version = "0.16.0", default-features = false, features = ["rustls_webpki"] }
 eyre = "0.6.8"
 futures = "0.3.25"
 serde = { version = "1.0.147", features = ["derive"] }
