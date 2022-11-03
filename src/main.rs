@@ -76,7 +76,7 @@ async fn main() {
             .service(actix_files::Files::new("/static", "./static"))
             .app_data(web::Data::new(cx))
     })
-    .bind(("127.0.0.1", 8080))
+    .bind(("0.0.0.0", 8080))
     .unwrap()
     .run()
     .await
