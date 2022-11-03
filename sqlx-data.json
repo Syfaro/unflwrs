@@ -1,0 +1,274 @@
+{
+  "db": "PostgreSQL",
+  "1fd94f1d96f700960dc4b224d9c185a447fca2504502d53656f9edf4c58e06cc": {
+    "describe": {
+      "columns": [
+        {
+          "name": "id",
+          "ordinal": 0,
+          "type_info": "Int8"
+        }
+      ],
+      "nullable": [
+        false
+      ],
+      "parameters": {
+        "Left": [
+          "Int8Array"
+        ]
+      }
+    },
+    "query": "SELECT id FROM twitter_account WHERE id = ANY($1) AND last_updated > now() - interval '7 day'"
+  },
+  "3f156606e0ac2eb546d56f1f164e80778649dff395733bf8e1849c08b5893bc0": {
+    "describe": {
+      "columns": [
+        {
+          "name": "max",
+          "ordinal": 0,
+          "type_info": "Timestamptz"
+        }
+      ],
+      "nullable": [
+        null
+      ],
+      "parameters": {
+        "Left": [
+          "Int8"
+        ]
+      }
+    },
+    "query": "SELECT max(created_at) FROM twitter_state WHERE login_twitter_account_id = $1"
+  },
+  "53195ea3e9d5641c8e5222e45b59840cd5e655ad946797dd2174e94b617514ac": {
+    "describe": {
+      "columns": [
+        {
+          "name": "id",
+          "ordinal": 0,
+          "type_info": "Int8"
+        },
+        {
+          "name": "screen_name",
+          "ordinal": 1,
+          "type_info": "Text"
+        },
+        {
+          "name": "display_name",
+          "ordinal": 2,
+          "type_info": "Text"
+        }
+      ],
+      "nullable": [
+        false,
+        false,
+        false
+      ],
+      "parameters": {
+        "Left": [
+          "Int8"
+        ]
+      }
+    },
+    "query": "SELECT id, screen_name, display_name FROM twitter_account WHERE id = $1"
+  },
+  "58823805c75b759216628af0dbf142a1b9b830a861dac74cb8dea969dc191fa7": {
+    "describe": {
+      "columns": [],
+      "nullable": [],
+      "parameters": {
+        "Left": [
+          "Int8"
+        ]
+      }
+    },
+    "query": "UPDATE twitter_login SET last_updated = current_timestamp WHERE twitter_account_id = $1"
+  },
+  "6da227467190b48509286792c7f07f5feb62b5505c672d4a55104c0e5f0b3ba0": {
+    "describe": {
+      "columns": [
+        {
+          "name": "follower_ids",
+          "ordinal": 0,
+          "type_info": "Int8Array"
+        }
+      ],
+      "nullable": [
+        false
+      ],
+      "parameters": {
+        "Left": [
+          "Int8"
+        ]
+      }
+    },
+    "query": "SELECT follower_ids FROM twitter_state WHERE login_twitter_account_id = $1 ORDER BY created_at DESC LIMIT 1"
+  },
+  "8392f1b4a9ae39df42c4184d84b27313c612234c328df8490e3356bcf705bc41": {
+    "describe": {
+      "columns": [],
+      "nullable": [],
+      "parameters": {
+        "Left": [
+          "Int8",
+          "Text",
+          "Text"
+        ]
+      }
+    },
+    "query": "INSERT INTO twitter_account (id, screen_name, display_name) VALUES ($1, $2, $3) ON CONFLICT (id) DO UPDATE SET last_updated = current_timestamp, screen_name = EXCLUDED.screen_name, display_name = EXCLUDED.display_name"
+  },
+  "b548046b584ba70a7841724e5f9ebd7d5e78bd6cfc2cdec2826ce90736c7a17d": {
+    "describe": {
+      "columns": [
+        {
+          "name": "created_at",
+          "ordinal": 0,
+          "type_info": "Timestamptz"
+        },
+        {
+          "name": "follower_count",
+          "ordinal": 1,
+          "type_info": "Int4"
+        }
+      ],
+      "nullable": [
+        false,
+        false
+      ],
+      "parameters": {
+        "Left": [
+          "Int8"
+        ]
+      }
+    },
+    "query": "SELECT created_at, follower_count FROM twitter_state WHERE login_twitter_account_id = $1 ORDER BY created_at LIMIT 100"
+  },
+  "b735305b65473e0097d8d0e3cf92a43238bb4ef06561dd180456ed4180962419": {
+    "describe": {
+      "columns": [],
+      "nullable": [],
+      "parameters": {
+        "Left": [
+          "Int8",
+          "Text",
+          "Text"
+        ]
+      }
+    },
+    "query": "INSERT INTO twitter_login (twitter_account_id, consumer_key, consumer_secret) VALUES ($1, $2, $3) ON CONFLICT (twitter_account_id) DO UPDATE SET consumer_key = EXCLUDED.consumer_key, consumer_secret = EXCLUDED.consumer_secret"
+  },
+  "bfef58fbf06d26d8155a74f82908bf68cb8878c3d6847a6f180a8ab58a57efad": {
+    "describe": {
+      "columns": [],
+      "nullable": [],
+      "parameters": {
+        "Left": [
+          "Int8",
+          "Int8"
+        ]
+      }
+    },
+    "query": "INSERT INTO twitter_event (login_twitter_account_id, related_twitter_account_id, event_name) VALUES ($1, $2, 'unfollow')"
+  },
+  "d7b961061c5261e238e0998219cbdf737efba47dc8588ebe6dfe9f20102ac9f6": {
+    "describe": {
+      "columns": [
+        {
+          "name": "created_at",
+          "ordinal": 0,
+          "type_info": "Timestamptz"
+        },
+        {
+          "name": "event_name",
+          "ordinal": 1,
+          "type_info": "Text"
+        },
+        {
+          "name": "id",
+          "ordinal": 2,
+          "type_info": "Int8"
+        },
+        {
+          "name": "screen_name",
+          "ordinal": 3,
+          "type_info": "Text"
+        },
+        {
+          "name": "display_name",
+          "ordinal": 4,
+          "type_info": "Text"
+        }
+      ],
+      "nullable": [
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      "parameters": {
+        "Left": [
+          "Int8"
+        ]
+      }
+    },
+    "query": "SELECT twitter_event.created_at, twitter_event.event_name, twitter_account.id, twitter_account.screen_name, twitter_account.display_name FROM twitter_event JOIN twitter_account ON twitter_account.id = twitter_event.related_twitter_account_id WHERE login_twitter_account_id = $1 ORDER BY created_at DESC LIMIT 5000"
+  },
+  "dd577925cc1939ffa737639f3e6d45e0d86bc3c3b7dae293d9d3d09d8fcce8a1": {
+    "describe": {
+      "columns": [],
+      "nullable": [],
+      "parameters": {
+        "Left": [
+          "Int8",
+          "Int8Array"
+        ]
+      }
+    },
+    "query": "INSERT INTO twitter_state (login_twitter_account_id, follower_ids) VALUES ($1, $2)"
+  },
+  "e557987e5411d2e2d55132697423fc146c7edb25f2105d00834ed3d457702fe6": {
+    "describe": {
+      "columns": [],
+      "nullable": [],
+      "parameters": {
+        "Left": [
+          "Int8",
+          "Int8"
+        ]
+      }
+    },
+    "query": "INSERT INTO twitter_event (login_twitter_account_id, related_twitter_account_id, event_name) VALUES ($1, $2, 'follow')"
+  },
+  "f2226d12403d034a84f645ed750894af01d95805880cb8558662b385e263451e": {
+    "describe": {
+      "columns": [
+        {
+          "name": "twitter_account_id",
+          "ordinal": 0,
+          "type_info": "Int8"
+        },
+        {
+          "name": "consumer_key",
+          "ordinal": 1,
+          "type_info": "Text"
+        },
+        {
+          "name": "consumer_secret",
+          "ordinal": 2,
+          "type_info": "Text"
+        }
+      ],
+      "nullable": [
+        false,
+        false,
+        false
+      ],
+      "parameters": {
+        "Left": []
+      }
+    },
+    "query": "SELECT twitter_account_id, consumer_key, consumer_secret FROM twitter_login WHERE last_updated IS NULL OR last_updated < now() - interval '1 day' LIMIT 100"
+  }
+}
