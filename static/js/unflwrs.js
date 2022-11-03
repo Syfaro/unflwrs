@@ -53,6 +53,11 @@ async function displayGraph() {
   const resp = await fetch('/feed/graph');
   const data = await resp.json();
 
+  if (data.length < 2) {
+    console.debug('Not enough data for graph');
+    return;
+  }
+
   const entries = data.map((row) => {
     return {
       x: new Date(row[0] * 1000),

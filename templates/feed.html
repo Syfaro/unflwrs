@@ -3,15 +3,15 @@
 {% block content %}
 <header class="container">
     <hgroup>
-        <h1>{{ user.display_name }}'s feed</h1>
+        <h1>@{{ user.screen_name }}'s feed</h1>
         {% match last_updated %}
         {% when Some with (last_updated) %}
         <h2>
-            Last updated
+            last updated
             <span class="relative-time" data-timestamp="{{ last_updated.timestamp() }}">{{ last_updated }}</span>
         </h2>
         {% else %}
-        <h2 data-unchecked="yes">Waiting for first update</h2>
+        <h2>waiting for first update</h2>
         {% endmatch %}
     </hgroup>
 
@@ -20,14 +20,14 @@
 
 <main class="container" data-page="feed">
     {% if events.is_empty() %}
-    <p>No events found yet. Please wait while data is discovered.</p>
+    <p>no events found yet. please wait while data is discovered.</p>
     {% else %}
     <table>
         <thead>
             <tr>
-                <th>Account</th>
-                <th>Event</th>
-                <th>Observed</th>
+                <th>account</th>
+                <th>event</th>
+                <th>observed</th>
             </tr>
         </thead>
         <tbody>
@@ -35,7 +35,7 @@
             <tr>
                 <td>
                     <a href="https://twitter.com/intent/user?user_id={{ entry.user.id }}">
-                        {{ entry.user.screen_name }}
+                        @{{ entry.user.screen_name }}
                     </a>
                 </td>
                 <td>{{ entry.event }}</td>
