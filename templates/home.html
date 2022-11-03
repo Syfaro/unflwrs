@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+
+{% block content %}
+<header class="container">
+    <h1>unflwrs</h1>
+</header>
+
+<main class="container">
+    <form method="POST" action="/twitter/login">
+        <button>Sign in with Twitter</button>
+    </form>
+</main>
+{% endblock %}

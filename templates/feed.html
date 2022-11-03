@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+
+{% block content %}
+<header class="container">
+    <hgroup>
+        <h1>{{ user.display_name }}'s feed</h1>
+        {% match last_updated %}
+        {% when Some with (last_updated) %}
+        <h2>
+            Last updated
+            <span class="relative-time" data-timestamp="{{ last_updated.timestamp() }}">{{ last_updated }}</span>
+        </h2>
+        {% else %}
+        <h2 data-unchecked="yes">Waiting for first update</h2>
+        {% endmatch %}
+    </hgroup>
+
+    <div class="ct-chart"></div>
+</header>
+
+<main class="container" data-page="feed">
+    {% if events.is_empty() %}
+    <p>No events found yet. Please wait while data is discovered.</p>
+    {% else %}
+    <table>
+        <thead>
+            <tr>
+                <th>Account</th>
+                <th>Event</th>
+                <th>Observed</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for entry in events %}
+            <tr>
+                <td>
+                    <a href="https://twitter.com/intent/user?user_id={{ entry.user.id }}">
+                        {{ entry.user.screen_name }}
+                    </a>
+                </td>
+                <td>{{ entry.event }}</td>
+                <td class="relative-time" data-timestamp="{{ entry.created_at.timestamp() }}">{{ entry.created_at }}
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% endif %}
+</main>
+{% endblock %}
