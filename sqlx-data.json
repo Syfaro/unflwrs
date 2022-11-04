@@ -1,5 +1,35 @@
 {
   "db": "PostgreSQL",
+  "0b568e38bed8b0640d8d551c7fc4290d1a74b241d8a4475a95c962d76e5e7345": {
+    "describe": {
+      "columns": [
+        {
+          "name": "twitter_account_id",
+          "ordinal": 0,
+          "type_info": "Int8"
+        },
+        {
+          "name": "consumer_key",
+          "ordinal": 1,
+          "type_info": "Text"
+        },
+        {
+          "name": "consumer_secret",
+          "ordinal": 2,
+          "type_info": "Text"
+        }
+      ],
+      "nullable": [
+        false,
+        false,
+        false
+      ],
+      "parameters": {
+        "Left": []
+      }
+    },
+    "query": "SELECT twitter_account_id, consumer_key, consumer_secret FROM twitter_login WHERE last_updated IS NULL OR last_updated < now() - interval '6 hours' LIMIT 100"
+  },
   "1fd94f1d96f700960dc4b224d9c185a447fca2504502d53656f9edf4c58e06cc": {
     "describe": {
       "columns": [
@@ -296,35 +326,5 @@
       }
     },
     "query": "INSERT INTO twitter_event (login_twitter_account_id, related_twitter_account_id, event_name) VALUES ($1, $2, 'follow')"
-  },
-  "f2226d12403d034a84f645ed750894af01d95805880cb8558662b385e263451e": {
-    "describe": {
-      "columns": [
-        {
-          "name": "twitter_account_id",
-          "ordinal": 0,
-          "type_info": "Int8"
-        },
-        {
-          "name": "consumer_key",
-          "ordinal": 1,
-          "type_info": "Text"
-        },
-        {
-          "name": "consumer_secret",
-          "ordinal": 2,
-          "type_info": "Text"
-        }
-      ],
-      "nullable": [
-        false,
-        false,
-        false
-      ],
-      "parameters": {
-        "Left": []
-      }
-    },
-    "query": "SELECT twitter_account_id, consumer_key, consumer_secret FROM twitter_login WHERE last_updated IS NULL OR last_updated < now() - interval '1 day' LIMIT 100"
   }
 }

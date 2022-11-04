@@ -200,17 +200,17 @@ async fn refresh_stale_accounts(pool: sqlx::PgPool, kp: egg_mode::KeyPair) {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5 * 60));
 
         loop {
+            interval.tick().await;
+
             if let Err(err) = refresh_accounts(&pool, &kp).await {
                 tracing::error!("could not refresh accounts: {err}");
             }
-
-            interval.tick().await;
         }
     });
 }
 
 async fn refresh_accounts(pool: &sqlx::PgPool, kp: &egg_mode::KeyPair) -> Result<(), AppError> {
-    let old_accounts = sqlx::query!("SELECT twitter_account_id, consumer_key, consumer_secret FROM twitter_login WHERE last_updated IS NULL OR last_updated < now() - interval '1 day' LIMIT 100").fetch_all(pool).await?;
+    let old_accounts = sqlx::query!("SELECT twitter_account_id, consumer_key, consumer_secret FROM twitter_login WHERE last_updated IS NULL OR last_updated < now() - interval '6 hours' LIMIT 100").fetch_all(pool).await?;
     tracing::info!("found {} accounts needing update", old_accounts.len());
 
     let tokens = old_accounts.into_iter().map(|row| {
