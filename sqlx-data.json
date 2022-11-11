@@ -114,6 +114,20 @@
     },
     "query": "SELECT max(created_at) FROM twitter_state WHERE login_twitter_account_id = $1"
   },
+  "4489aab9f2df12834706dace74d43bcd614f1fc25ba27fb77d115dd744c5a97f": {
+    "describe": {
+      "columns": [],
+      "nullable": [],
+      "parameters": {
+        "Left": [
+          "Int8",
+          "Text",
+          "Text"
+        ]
+      }
+    },
+    "query": "INSERT INTO twitter_login (twitter_account_id, consumer_key, consumer_secret) VALUES ($1, $2, $3) ON CONFLICT (twitter_account_id) DO UPDATE SET consumer_key = EXCLUDED.consumer_key, consumer_secret = EXCLUDED.consumer_secret, error_count = 0"
+  },
   "53195ea3e9d5641c8e5222e45b59840cd5e655ad946797dd2174e94b617514ac": {
     "describe": {
       "columns": [
@@ -241,20 +255,6 @@
       }
     },
     "query": "SELECT created_at, follower_count FROM twitter_state WHERE login_twitter_account_id = $1 ORDER BY created_at LIMIT 100"
-  },
-  "b735305b65473e0097d8d0e3cf92a43238bb4ef06561dd180456ed4180962419": {
-    "describe": {
-      "columns": [],
-      "nullable": [],
-      "parameters": {
-        "Left": [
-          "Int8",
-          "Text",
-          "Text"
-        ]
-      }
-    },
-    "query": "INSERT INTO twitter_login (twitter_account_id, consumer_key, consumer_secret) VALUES ($1, $2, $3) ON CONFLICT (twitter_account_id) DO UPDATE SET consumer_key = EXCLUDED.consumer_key, consumer_secret = EXCLUDED.consumer_secret"
   },
   "bbd72fe2f25ce70e03b9b579238de8eb4e4ec2441c299896300ad1211afbcc9a": {
     "describe": {

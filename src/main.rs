@@ -352,7 +352,7 @@ async fn twitter_callback(
     ).execute(&cx.pool).await.map_err(actix_web::error::ErrorInternalServerError)?;
 
     sqlx::query!(
-        "INSERT INTO twitter_login (twitter_account_id, consumer_key, consumer_secret) VALUES ($1, $2, $3) ON CONFLICT (twitter_account_id) DO UPDATE SET consumer_key = EXCLUDED.consumer_key, consumer_secret = EXCLUDED.consumer_secret",
+        "INSERT INTO twitter_login (twitter_account_id, consumer_key, consumer_secret) VALUES ($1, $2, $3) ON CONFLICT (twitter_account_id) DO UPDATE SET consumer_key = EXCLUDED.consumer_key, consumer_secret = EXCLUDED.consumer_secret, error_count = 0",
         i64::try_from(account.id).unwrap(),
         user_kp.key.as_ref(),
         user_kp.secret.as_ref()
