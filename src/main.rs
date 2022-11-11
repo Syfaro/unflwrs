@@ -438,9 +438,9 @@ async fn oneoff(
 struct TwitterEntry<'a> {
     id: u64,
     screen_name: Option<&'a str>,
-    website: Option<&'a str>,
+    website: Option<String>,
     location: Option<&'a str>,
-    bio: Option<&'a str>,
+    bio: Option<String>,
 }
 
 async fn create_user_entry<W: tokio::io::AsyncWrite + Unpin>(
@@ -455,13 +455,46 @@ async fn create_user_entry<W: tokio::io::AsyncWrite + Unpin>(
 
     for id in ids.iter().copied() {
         let row = match users.get(&id) {
-            Some(user) => TwitterEntry {
-                id: user.id,
-                screen_name: Some(&user.screen_name),
-                website: user.url.as_deref(),
-                location: user.location.as_deref(),
-                bio: user.description.as_deref(),
-            },
+            Some(user) => {
+                let url = user.url.as_deref().map(|url| {
+                    if let Some(url_entities) = &user.entities.url {
+                        url_entities
+                            .urls
+                            .iter()
+                            .fold(url.to_string(), |url, entity| {
+                                if let Some(expanded_url) = entity.expanded_url.as_deref() {
+                                    url.replace(&entity.url, expanded_url)
+                                } else {
+                                    url
+                                }
+                            })
+                    } else {
+                        url.to_string()
+                    }
+                });
+
+                let bio = user.description.as_deref().map(|bio| {
+                    user.entities
+                        .description
+                        .urls
+                        .iter()
+                        .fold(bio.to_string(), |bio, entity| {
+                            if let Some(expanded_url) = entity.expanded_url.as_deref() {
+                                bio.replace(&entity.url, expanded_url)
+                            } else {
+                                bio
+                            }
+                        })
+                });
+
+                TwitterEntry {
+                    id: user.id,
+                    screen_name: Some(&user.screen_name),
+                    website: url,
+                    location: user.location.as_deref(),
+                    bio,
+                }
+            }
             None => {
                 tracing::warn!("user was not loaded: {id}");
 
