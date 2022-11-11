@@ -172,6 +172,18 @@
     },
     "query": "UPDATE twitter_login SET last_updated = current_timestamp WHERE twitter_account_id = $1"
   },
+  "667b34227ec3e086606f7cf129e730ce76e7c959d882b12913a26c3e8e369448": {
+    "describe": {
+      "columns": [],
+      "nullable": [],
+      "parameters": {
+        "Left": [
+          "Jsonb"
+        ]
+      }
+    },
+    "query": "INSERT INTO twitter_event\n                (login_twitter_account_id, related_twitter_account_id, event_name)\n            SELECT\n                event.login_twitter_account_id,\n                event.related_twitter_account_id,\n                event.event\n            FROM jsonb_to_recordset($1) AS\n                event(login_twitter_account_id bigint, related_twitter_account_id bigint, event text)\n            JOIN twitter_account\n                ON twitter_account.id = event.login_twitter_account_id"
+  },
   "6da227467190b48509286792c7f07f5feb62b5505c672d4a55104c0e5f0b3ba0": {
     "describe": {
       "columns": [
@@ -282,19 +294,6 @@
     },
     "query": "SELECT consumer_key, consumer_secret FROM twitter_login WHERE twitter_account_id = $1"
   },
-  "bfef58fbf06d26d8155a74f82908bf68cb8878c3d6847a6f180a8ab58a57efad": {
-    "describe": {
-      "columns": [],
-      "nullable": [],
-      "parameters": {
-        "Left": [
-          "Int8",
-          "Int8"
-        ]
-      }
-    },
-    "query": "INSERT INTO twitter_event (login_twitter_account_id, related_twitter_account_id, event_name) VALUES ($1, $2, 'unfollow')"
-  },
   "d7b961061c5261e238e0998219cbdf737efba47dc8588ebe6dfe9f20102ac9f6": {
     "describe": {
       "columns": [
@@ -351,18 +350,5 @@
       }
     },
     "query": "INSERT INTO twitter_state (login_twitter_account_id, follower_ids) VALUES ($1, $2)"
-  },
-  "e557987e5411d2e2d55132697423fc146c7edb25f2105d00834ed3d457702fe6": {
-    "describe": {
-      "columns": [],
-      "nullable": [],
-      "parameters": {
-        "Left": [
-          "Int8",
-          "Int8"
-        ]
-      }
-    },
-    "query": "INSERT INTO twitter_event (login_twitter_account_id, related_twitter_account_id, event_name) VALUES ($1, $2, 'follow')"
   }
 }
