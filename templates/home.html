@@ -11,6 +11,11 @@
 <main class="container">
     <form method="POST" action="/twitter/login">
         <button>sign in with twitter</button>
+
+        <label for="oneoff">
+            <input type="checkbox" id="oneoff" name="oneoff" value="yes">
+            perform a one-off export of friends and followers instead
+        </label>
     </form>
 </main>
 {% endblock %}

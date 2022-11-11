@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use actix_session::{storage::CookieSessionStore, Session, SessionMiddleware};
 use actix_web::{get, post, web, App, HttpResponse, HttpServer};
@@ -6,7 +6,8 @@ use askama::Template;
 use bytes::Bytes;
 use clap::Parser;
 use futures::{StreamExt, TryStreamExt};
-use serde::Deserialize;
+use itertools::Itertools;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Parser)]
 struct Config {
@@ -260,10 +261,16 @@ async fn home(sess: Session) -> Result<actix_web::HttpResponse, AppError> {
         .body(body))
 }
 
+#[derive(Deserialize)]
+struct LoginForm {
+    oneoff: Option<String>,
+}
+
 #[post("/twitter/login")]
 async fn twitter_login(
     cx: web::Data<Context>,
     sess: Session,
+    form: web::Form<LoginForm>,
 ) -> Result<actix_web::HttpResponse, AppError> {
     let request_token =
         egg_mode::auth::request_token(&cx.kp, format!("{}/twitter/callback", cx.config.host_url))
@@ -271,6 +278,9 @@ async fn twitter_login(
     let auth_url = egg_mode::auth::authorize_url(&request_token);
 
     sess.insert("twitter-request-token", request_token)?;
+    if form.oneoff.as_deref().unwrap_or_default() == "yes" {
+        sess.insert("oneoff", true)?;
+    }
 
     Ok(actix_web::HttpResponse::Found()
         .insert_header(("location", auth_url))
@@ -306,6 +316,14 @@ async fn twitter_callback(
         egg_mode::auth::access_token(cx.kp.clone(), &request_token, &query.oauth_verifier)
             .await
             .map_err(actix_web::error::ErrorBadRequest)?;
+
+    if sess
+        .get::<bool>("oneoff")
+        .unwrap_or_default()
+        .unwrap_or_default()
+    {
+        return oneoff(user_id, token, sess).await;
+    }
 
     let user_kp = match &token {
         egg_mode::Token::Access {
@@ -346,6 +364,119 @@ async fn twitter_callback(
     Ok(HttpResponse::Found()
         .insert_header(("location", "/feed"))
         .finish())
+}
+
+async fn oneoff(
+    user_id: u64,
+    token: egg_mode::Token,
+    sess: Session,
+) -> actix_web::Result<actix_web::HttpResponse> {
+    tracing::info!("{user_id} requested oneoff export");
+    sess.clear();
+
+    let follower_ids = egg_mode::user::followers_ids(user_id, &token)
+        .with_page_size(5000)
+        .map_ok(|r| r.response)
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(actix_web::error::ErrorInternalServerError)?;
+    tracing::debug!("found {} followers", follower_ids.len());
+
+    let friend_ids = egg_mode::user::friends_ids(user_id, &token)
+        .with_page_size(5000)
+        .map_ok(|r| r.response)
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(actix_web::error::ErrorInternalServerError)?;
+    tracing::debug!("found {} friends", friend_ids.len());
+
+    let mut users = HashMap::with_capacity(follower_ids.len() + friend_ids.len());
+
+    let chunks = follower_ids
+        .iter()
+        .chain(friend_ids.iter())
+        .unique()
+        .chunks(100);
+    for (idx, chunk) in chunks.into_iter().enumerate() {
+        tracing::debug!("loading chunk {idx}");
+
+        let ids = chunk.map(|id| egg_mode::user::UserID::ID(*id));
+        let resp = egg_mode::user::lookup(ids, &token)
+            .await
+            .map_err(actix_web::error::ErrorInternalServerError)?;
+
+        for user in resp.response {
+            users.insert(user.id, user);
+        }
+    }
+    tracing::debug!("fetched information for {} users", users.len());
+
+    let (mut wtr, rdr) = tokio::io::duplex(1024);
+
+    tokio::task::spawn(async move {
+        let mut wtr = async_zip::write::ZipFileWriter::new(&mut wtr);
+
+        create_user_entry(&mut wtr, "followers.csv".to_string(), &users, &follower_ids).await;
+        create_user_entry(&mut wtr, "friends.csv".to_string(), &users, &friend_ids).await;
+
+        wtr.close().await.unwrap();
+    });
+
+    let stream = tokio_util::codec::FramedRead::new(rdr, tokio_util::codec::BytesCodec::new())
+        .map_ok(|b| b.freeze());
+
+    Ok(HttpResponse::Ok()
+        .insert_header((
+            "content-disposition",
+            r#"attachment; filename="twitter-users.zip""#,
+        ))
+        .content_type("application/zip")
+        .streaming(stream))
+}
+
+#[derive(Default, Serialize)]
+struct TwitterEntry<'a> {
+    id: u64,
+    screen_name: Option<&'a str>,
+    website: Option<&'a str>,
+    location: Option<&'a str>,
+    bio: Option<&'a str>,
+}
+
+async fn create_user_entry<W: tokio::io::AsyncWrite + Unpin>(
+    wtr: &mut async_zip::write::ZipFileWriter<W>,
+    name: String,
+    users: &HashMap<u64, egg_mode::user::TwitterUser>,
+    ids: &[u64],
+) {
+    let opts = async_zip::ZipEntryBuilder::new(name, async_zip::Compression::Deflate);
+    let entry_writer = wtr.write_entry_stream(opts).await.unwrap();
+    let mut csv = csv_async::AsyncSerializer::from_writer(entry_writer);
+
+    for id in ids.iter().copied() {
+        let row = match users.get(&id) {
+            Some(user) => TwitterEntry {
+                id: user.id,
+                screen_name: Some(&user.screen_name),
+                website: user.url.as_deref(),
+                location: user.location.as_deref(),
+                bio: user.description.as_deref(),
+            },
+            None => {
+                tracing::warn!("user was not loaded: {id}");
+
+                TwitterEntry {
+                    id,
+                    ..Default::default()
+                }
+            }
+        };
+
+        csv.serialize(row).await.unwrap();
+    }
+
+    let entry_writer = csv.into_inner().await.unwrap();
+    entry_writer.close().await.unwrap();
 }
 
 #[allow(dead_code)]
