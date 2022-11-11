@@ -76,6 +76,7 @@ async fn main() {
             .service(feed)
             .service(feed_graph)
             .service(export_csv)
+            .service(export_ff)
             .service(account_delete)
             .service(actix_files::Files::new("/static", "./static"))
             .app_data(web::Data::new(cx))
@@ -322,7 +323,8 @@ async fn twitter_callback(
         .unwrap_or_default()
         .unwrap_or_default()
     {
-        return oneoff(user_id, token, sess).await;
+        sess.clear();
+        return oneoff(user_id, token).await;
     }
 
     let user_kp = match &token {
@@ -366,13 +368,37 @@ async fn twitter_callback(
         .finish())
 }
 
+#[get("/export/ff")]
+async fn export_ff(
+    cx: web::Data<Context>,
+    sess: Session,
+) -> Result<actix_web::HttpResponse, actix_web::Error> {
+    let Some(user_id) = sess
+        .get::<i64>("twitter-user-id")? else {
+            return Ok(HttpResponse::Found().insert_header(("location", "/")).finish())
+        };
+
+    let user = sqlx::query!(
+        "SELECT consumer_key, consumer_secret FROM twitter_login WHERE twitter_account_id = $1",
+        user_id
+    )
+    .fetch_one(&cx.pool)
+    .await
+    .map_err(actix_web::error::ErrorInternalServerError)?;
+
+    let token = egg_mode::Token::Access {
+        consumer: cx.kp.clone(),
+        access: egg_mode::KeyPair::new(user.consumer_key, user.consumer_secret),
+    };
+
+    return oneoff(u64::try_from(user_id).unwrap(), token).await;
+}
+
 async fn oneoff(
     user_id: u64,
     token: egg_mode::Token,
-    sess: Session,
 ) -> actix_web::Result<actix_web::HttpResponse> {
     tracing::info!("{user_id} requested oneoff export");
-    sess.clear();
 
     let follower_ids = egg_mode::user::followers_ids(user_id, &token)
         .with_page_size(5000)
