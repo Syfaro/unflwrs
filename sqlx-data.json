@@ -1,6 +1,6 @@
 {
   "db": "PostgreSQL",
-  "0b568e38bed8b0640d8d551c7fc4290d1a74b241d8a4475a95c962d76e5e7345": {
+  "001722a3f13b4dd87d6bb51fe17f5dc8df8329f8c5c88abed160418e0bd0a7cc": {
     "describe": {
       "columns": [
         {
@@ -28,7 +28,7 @@
         "Left": []
       }
     },
-    "query": "SELECT twitter_account_id, consumer_key, consumer_secret FROM twitter_login WHERE last_updated IS NULL OR last_updated < now() - interval '6 hours' LIMIT 100"
+    "query": "SELECT twitter_account_id, consumer_key, consumer_secret FROM twitter_login WHERE last_updated IS NULL OR last_updated < now() - interval '6 hours' AND error_count < 10 LIMIT 100"
   },
   "1fd94f1d96f700960dc4b224d9c185a447fca2504502d53656f9edf4c58e06cc": {
     "describe": {
@@ -178,6 +178,18 @@
     },
     "query": "SELECT follower_ids FROM twitter_state WHERE login_twitter_account_id = $1 ORDER BY created_at DESC LIMIT 1"
   },
+  "6faaab395cb6394924c9c5feb34bc32ed34e39ff2e2b529eca55695788869b75": {
+    "describe": {
+      "columns": [],
+      "nullable": [],
+      "parameters": {
+        "Left": [
+          "Int8"
+        ]
+      }
+    },
+    "query": "UPDATE twitter_login SET error_count = error_count + 1 WHERE twitter_account_id = $1"
+  },
   "7efea2c61ea2da5e4601da4d0f104771a0b5adeab03d3fa8409c659c37080e34": {
     "describe": {
       "columns": [],
@@ -243,6 +255,32 @@
       }
     },
     "query": "INSERT INTO twitter_login (twitter_account_id, consumer_key, consumer_secret) VALUES ($1, $2, $3) ON CONFLICT (twitter_account_id) DO UPDATE SET consumer_key = EXCLUDED.consumer_key, consumer_secret = EXCLUDED.consumer_secret"
+  },
+  "bbd72fe2f25ce70e03b9b579238de8eb4e4ec2441c299896300ad1211afbcc9a": {
+    "describe": {
+      "columns": [
+        {
+          "name": "consumer_key",
+          "ordinal": 0,
+          "type_info": "Text"
+        },
+        {
+          "name": "consumer_secret",
+          "ordinal": 1,
+          "type_info": "Text"
+        }
+      ],
+      "nullable": [
+        false,
+        false
+      ],
+      "parameters": {
+        "Left": [
+          "Int8"
+        ]
+      }
+    },
+    "query": "SELECT consumer_key, consumer_secret FROM twitter_login WHERE twitter_account_id = $1"
   },
   "bfef58fbf06d26d8155a74f82908bf68cb8878c3d6847a6f180a8ab58a57efad": {
     "describe": {
