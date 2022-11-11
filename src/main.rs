@@ -105,6 +105,13 @@ impl<E: std::error::Error + Send + Sync + 'static> From<E> for AppError {
     }
 }
 
+#[derive(Serialize)]
+struct TwitterDbEvent {
+    login_twitter_account_id: i64,
+    related_twitter_account_id: i64,
+    event: &'static str,
+}
+
 #[tracing::instrument(skip(pool, token))]
 async fn refresh_account(
     pool: sqlx::PgPool,
@@ -165,12 +172,35 @@ async fn refresh_account(
     let new_unfollower_ids = existing_follower_ids.difference(&current_follower_ids);
     let new_follower_ids = current_follower_ids.difference(&existing_follower_ids);
 
-    for unfollower_id in new_unfollower_ids {
-        sqlx::query!("INSERT INTO twitter_event (login_twitter_account_id, related_twitter_account_id, event_name) VALUES ($1, $2, 'unfollow')", i64::try_from(user_id).unwrap(), i64::try_from(*unfollower_id).unwrap()).execute(&mut tx).await?;
-    }
+    let events: Vec<_> = new_unfollower_ids
+        .map(|id| (*id, "unfollow"))
+        .chain(new_follower_ids.map(|id| (*id, "follow")))
+        .map(|(related_id, event)| TwitterDbEvent {
+            login_twitter_account_id: i64::try_from(user_id).unwrap(),
+            related_twitter_account_id: i64::try_from(related_id).unwrap(),
+            event,
+        })
+        .collect();
 
-    for follower_id in new_follower_ids {
-        sqlx::query!("INSERT INTO twitter_event (login_twitter_account_id, related_twitter_account_id, event_name) VALUES ($1, $2, 'follow')", i64::try_from(user_id).unwrap(), i64::try_from(*follower_id).unwrap()).execute(&mut tx).await?;
+    for (idx, chunk) in events.chunks(100).enumerate() {
+        tracing::debug!("inserting chunk {idx} of {} events", chunk.len());
+        let data = serde_json::to_value(chunk)?;
+
+        sqlx::query!(
+            "INSERT INTO twitter_event
+                (login_twitter_account_id, related_twitter_account_id, event_name)
+            SELECT
+                event.login_twitter_account_id,
+                event.related_twitter_account_id,
+                event.event
+            FROM jsonb_to_recordset($1) AS
+                event(login_twitter_account_id bigint, related_twitter_account_id bigint, event text)
+            JOIN twitter_account
+                ON twitter_account.id = event.login_twitter_account_id",
+            data
+        )
+        .execute(&mut tx)
+        .await?;
     }
 
     sqlx::query!(
