@@ -268,32 +268,6 @@
     },
     "query": "SELECT created_at, follower_count FROM twitter_state WHERE login_twitter_account_id = $1 ORDER BY created_at LIMIT 100"
   },
-  "bbd72fe2f25ce70e03b9b579238de8eb4e4ec2441c299896300ad1211afbcc9a": {
-    "describe": {
-      "columns": [
-        {
-          "name": "consumer_key",
-          "ordinal": 0,
-          "type_info": "Text"
-        },
-        {
-          "name": "consumer_secret",
-          "ordinal": 1,
-          "type_info": "Text"
-        }
-      ],
-      "nullable": [
-        false,
-        false
-      ],
-      "parameters": {
-        "Left": [
-          "Int8"
-        ]
-      }
-    },
-    "query": "SELECT consumer_key, consumer_secret FROM twitter_login WHERE twitter_account_id = $1"
-  },
   "d7b961061c5261e238e0998219cbdf737efba47dc8588ebe6dfe9f20102ac9f6": {
     "describe": {
       "columns": [
