@@ -19,7 +19,11 @@
 
     <footer class="container">
         <p>a project by <a href="https://syfaro.net">syfaro</a></p>
-        <p>v{{ env!("CARGO_PKG_VERSION") }}</p>
+        <p>
+            <a href="https://github.com/Syfaro/unflwrs/releases/tag/v{{ env!("CARGO_PKG_VERSION") }}">
+                v{{ env!("CARGO_PKG_VERSION") }}
+            </a>
+        </p>
     </footer>
 
     <script src="/static/js/chartist.min.js?{{ env!("CARGO_PKG_VERSION") }}"></script>
