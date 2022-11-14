@@ -6,7 +6,6 @@ use askama::Template;
 use bytes::Bytes;
 use clap::Parser;
 use futures::{StreamExt, TryFutureExt, TryStreamExt};
-use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use twitter_v2::{
     authorization::{Oauth2Client, Oauth2Token, Scope},
@@ -101,6 +100,7 @@ async fn main() {
             .service(feed_graph)
             .service(export_csv)
             .service(export_ff)
+            .service(signout)
             .service(account_delete)
             .service(actix_files::Files::new("/static", "./static"))
             .app_data(web::Data::new(cx))
@@ -348,7 +348,6 @@ async fn twitter_login(
 
         sess.insert("twitter-verifier", verifier)?;
         sess.insert("twitter-state", state)?;
-        sess.insert("oneoff", true)?;
 
         url.as_str().to_string()
     } else {
@@ -398,15 +397,6 @@ async fn twitter_callback(
         egg_mode::auth::access_token(cx.kp.clone(), &request_token, &query.oauth_verifier)
             .await
             .map_err(actix_web::error::ErrorBadRequest)?;
-
-    if sess
-        .get::<bool>("oneoff")
-        .unwrap_or_default()
-        .unwrap_or_default()
-    {
-        sess.clear();
-        return oneoff(user_id, token).await;
-    }
 
     let user_kp = match &token {
         egg_mode::Token::Access {
@@ -771,136 +761,28 @@ async fn oneoff_v2(
         .streaming(stream))
 }
 
+#[derive(Template)]
+#[template(path = "ff_message.html")]
+struct FFMessageTemplate;
+
 #[get("/export/ff")]
-async fn export_ff(
-    cx: web::Data<Context>,
-    sess: Session,
-) -> Result<actix_web::HttpResponse, actix_web::Error> {
-    let Some(user_id) = sess
-        .get::<i64>("twitter-user-id")? else {
-            return Ok(HttpResponse::Found().insert_header(("location", "/")).finish())
-        };
-
-    let user = sqlx::query!(
-        "SELECT consumer_key, consumer_secret FROM twitter_login WHERE twitter_account_id = $1",
-        user_id
-    )
-    .fetch_one(&cx.pool)
-    .await
-    .map_err(actix_web::error::ErrorInternalServerError)?;
-
-    let token = egg_mode::Token::Access {
-        consumer: cx.kp.clone(),
-        access: egg_mode::KeyPair::new(user.consumer_key, user.consumer_secret),
-    };
-
-    oneoff(u64::try_from(user_id).unwrap(), token).await
-}
-
-#[tracing::instrument(skip(token))]
-async fn oneoff(
-    user_id: u64,
-    token: egg_mode::Token,
-) -> actix_web::Result<actix_web::HttpResponse> {
-    tracing::info!("requested oneoff export");
-
-    let follower_ids = egg_mode::user::followers_ids(user_id, &token)
-        .with_page_size(5000)
-        .map_ok(|r| r.response)
-        .try_collect::<Vec<_>>()
-        .await
+async fn export_ff() -> Result<actix_web::HttpResponse, actix_web::Error> {
+    let body = FFMessageTemplate
+        .render()
         .map_err(actix_web::error::ErrorInternalServerError)?;
-    tracing::debug!("found {} followers", follower_ids.len());
-
-    let friend_ids = egg_mode::user::friends_ids(user_id, &token)
-        .with_page_size(5000)
-        .map_ok(|r| r.response)
-        .try_collect::<Vec<_>>()
-        .await
-        .map_err(actix_web::error::ErrorInternalServerError)?;
-    tracing::debug!("found {} friends", friend_ids.len());
-
-    let lists = egg_mode::list::ownerships(user_id, &token)
-        .with_page_size(1000)
-        .map_ok(|r| r.response)
-        .try_collect::<Vec<_>>()
-        .await
-        .map_err(actix_web::error::ErrorInternalServerError)?;
-    tracing::debug!("found {} lists", lists.len());
-
-    let list_members = lists.iter().map(|list| list.member_count).sum::<u64>() as usize;
-    let mut users = HashMap::with_capacity(follower_ids.len() + friend_ids.len() + list_members);
-    let mut list_entries: HashMap<u64, (String, Vec<u64>)> = HashMap::with_capacity(lists.len());
-
-    for list in lists {
-        tracing::debug!(list_id = list.id, "loading list");
-
-        let members = egg_mode::list::members(egg_mode::list::ListID::ID(list.id), &token)
-            .with_page_size(5000)
-            .map_ok(|r| r.response)
-            .try_collect::<Vec<_>>()
-            .await
-            .map_err(actix_web::error::ErrorInternalServerError)?;
-
-        let ids: Vec<_> = members.iter().map(|member| member.id).collect();
-        tracing::debug!(list_id = list.id, "found {} users in list", ids.len());
-        list_entries.insert(list.id, (list.slug, ids));
-
-        users.extend(members.into_iter().map(|member| (member.id, member)));
-    }
-
-    let listed_users: HashSet<_> = users.iter().map(|(user_id, _user_data)| *user_id).collect();
-    tracing::debug!("found {} users in lists", listed_users.len());
-
-    let chunks = follower_ids
-        .iter()
-        .chain(friend_ids.iter())
-        .filter(|user_id| !listed_users.contains(user_id))
-        .unique()
-        .chunks(100);
-    for (idx, chunk) in chunks.into_iter().enumerate() {
-        tracing::debug!("loading chunk {idx}");
-
-        let ids = chunk.map(|id| egg_mode::user::UserID::ID(*id));
-        let resp = egg_mode::user::lookup(ids, &token)
-            .await
-            .map_err(actix_web::error::ErrorInternalServerError)?;
-
-        users.extend(resp.response.into_iter().map(|user| (user.id, user)));
-    }
-    tracing::debug!("fetched information for {} users", users.len());
-
-    let (mut wtr, rdr) = tokio::io::duplex(1024);
-
-    tokio::task::spawn(async move {
-        let mut wtr = async_zip::write::ZipFileWriter::new(&mut wtr);
-
-        create_user_entry(&mut wtr, "followers.csv".to_string(), &users, &follower_ids).await;
-        create_user_entry(&mut wtr, "following.csv".to_string(), &users, &friend_ids).await;
-
-        for (id, (slug, member_ids)) in list_entries {
-            create_user_entry(
-                &mut wtr,
-                format!("list-{id}-{slug}.csv"),
-                &users,
-                &member_ids,
-            )
-            .await;
-        }
-
-        wtr.close().await.unwrap();
-    });
-
-    let stream = tokio_util::codec::FramedRead::new(rdr, tokio_util::codec::BytesCodec::new())
-        .map_ok(|b| b.freeze());
 
     Ok(HttpResponse::Ok()
-        .insert_header((
-            "content-disposition",
-            r#"attachment; filename="twitter-users.zip""#,
-        ))
-        .content_type("application/zip")
-        .streaming(stream))
+        .insert_header(("content-type", "text/html"))
+        .body(body))
+}
+
+#[post("/signout")]
+async fn signout(sess: Session) -> Result<actix_web::HttpResponse, actix_web::Error> {
+    sess.clear();
+
+    Ok(HttpResponse::Found()
+        .insert_header(("location", "/"))
+        .finish())
 }
 
 #[derive(Default, Serialize)]
@@ -911,77 +793,6 @@ struct TwitterEntry<'a> {
     location: Option<&'a str>,
     bio: Option<String>,
     pinned_tweet: Option<String>,
-}
-
-#[tracing::instrument(skip(wtr, users, ids))]
-async fn create_user_entry<W: tokio::io::AsyncWrite + Unpin>(
-    wtr: &mut async_zip::write::ZipFileWriter<W>,
-    name: String,
-    users: &HashMap<u64, egg_mode::user::TwitterUser>,
-    ids: &[u64],
-) {
-    let opts = async_zip::ZipEntryBuilder::new(name, async_zip::Compression::Deflate);
-    let entry_writer = wtr.write_entry_stream(opts).await.unwrap();
-    let mut csv = csv_async::AsyncSerializer::from_writer(entry_writer);
-
-    for id in ids.iter().copied() {
-        let row = match users.get(&id) {
-            Some(user) => {
-                let url = user.url.as_deref().map(|url| {
-                    if let Some(url_entities) = &user.entities.url {
-                        url_entities
-                            .urls
-                            .iter()
-                            .fold(url.to_string(), |url, entity| {
-                                if let Some(expanded_url) = entity.expanded_url.as_deref() {
-                                    url.replace(&entity.url, expanded_url)
-                                } else {
-                                    url
-                                }
-                            })
-                    } else {
-                        url.to_string()
-                    }
-                });
-
-                let bio = user.description.as_deref().map(|bio| {
-                    user.entities
-                        .description
-                        .urls
-                        .iter()
-                        .fold(bio.to_string(), |bio, entity| {
-                            if let Some(expanded_url) = entity.expanded_url.as_deref() {
-                                bio.replace(&entity.url, expanded_url)
-                            } else {
-                                bio
-                            }
-                        })
-                });
-
-                TwitterEntry {
-                    id: user.id,
-                    screen_name: Some(&user.screen_name),
-                    website: url,
-                    location: user.location.as_deref(),
-                    bio,
-                    pinned_tweet: None,
-                }
-            }
-            None => {
-                tracing::warn!("user was not loaded: {id}");
-
-                TwitterEntry {
-                    id,
-                    ..Default::default()
-                }
-            }
-        };
-
-        csv.serialize(row).await.unwrap();
-    }
-
-    let entry_writer = csv.into_inner().await.unwrap();
-    entry_writer.close().await.unwrap();
 }
 
 #[tracing::instrument(skip(wtr, users, ids))]

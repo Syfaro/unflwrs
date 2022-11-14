@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+
+{% block content %}
+<main class="container">
+    <p>please sign out and use the export checkbox on homepage for more complete data.</p>
+
+    <form method="post" action="/signout">
+        <button>sign out</button>
+    </form>
+</main>
+{% endblock %}
