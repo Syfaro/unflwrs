@@ -450,10 +450,42 @@ async fn oneoff(
         .map_err(actix_web::error::ErrorInternalServerError)?;
     tracing::debug!("found {} friends", friend_ids.len());
 
+    let lists = egg_mode::list::ownerships(user_id, &token)
+        .with_page_size(1000)
+        .map_ok(|r| r.response)
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(actix_web::error::ErrorInternalServerError)?;
+    tracing::debug!("found {} lists", lists.len());
+
     let mut users = HashMap::with_capacity(follower_ids.len() + friend_ids.len());
+
+    let mut list_names: HashMap<u64, String> = HashMap::with_capacity(lists.len());
+    let mut list_members: HashMap<u64, Vec<u64>> = HashMap::with_capacity(lists.len());
+
+    for list in lists {
+        list_names.insert(list.id, list.slug);
+
+        let members = egg_mode::list::members(egg_mode::list::ListID::ID(list.id), &token)
+            .with_page_size(5000)
+            .map_ok(|r| r.response)
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(actix_web::error::ErrorInternalServerError)?;
+
+        for member in members.iter() {
+            list_members.entry(list.id).or_default().push(member.id);
+        }
+
+        users.extend(members.into_iter().map(|member| (member.id, member)));
+    }
+
+    let listed_users: HashSet<_> = users.iter().map(|(user_id, _user_data)| *user_id).collect();
+    tracing::debug!("found {} users in lists", listed_users.len());
 
     let chunks = follower_ids
         .iter()
+        .filter(|user_id| !listed_users.contains(user_id))
         .chain(friend_ids.iter())
         .unique()
         .chunks(100);
@@ -478,6 +510,12 @@ async fn oneoff(
 
         create_user_entry(&mut wtr, "followers.csv".to_string(), &users, &follower_ids).await;
         create_user_entry(&mut wtr, "friends.csv".to_string(), &users, &friend_ids).await;
+
+        for (id, slug) in list_names {
+            if let Some(members) = list_members.get(&id) {
+                create_user_entry(&mut wtr, format!("list-{id}-{slug}.csv"), &users, members).await;
+            }
+        }
 
         wtr.close().await.unwrap();
     });
