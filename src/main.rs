@@ -80,6 +80,7 @@ async fn main() {
             .service(account_delete)
             .service(actix_files::Files::new("/static", "./static"))
             .app_data(web::Data::new(cx))
+            .wrap(tracing_actix_web::TracingLogger::default())
     })
     .bind(("0.0.0.0", 8080))
     .unwrap()
@@ -428,11 +429,12 @@ async fn export_ff(
     oneoff(u64::try_from(user_id).unwrap(), token).await
 }
 
+#[tracing::instrument(skip(token))]
 async fn oneoff(
     user_id: u64,
     token: egg_mode::Token,
 ) -> actix_web::Result<actix_web::HttpResponse> {
-    tracing::info!("{user_id} requested oneoff export");
+    tracing::info!("requested oneoff export");
 
     let follower_ids = egg_mode::user::followers_ids(user_id, &token)
         .with_page_size(5000)
@@ -458,13 +460,12 @@ async fn oneoff(
         .map_err(actix_web::error::ErrorInternalServerError)?;
     tracing::debug!("found {} lists", lists.len());
 
-    let mut users = HashMap::with_capacity(follower_ids.len() + friend_ids.len());
-
-    let mut list_names: HashMap<u64, String> = HashMap::with_capacity(lists.len());
-    let mut list_members: HashMap<u64, Vec<u64>> = HashMap::with_capacity(lists.len());
+    let list_members = lists.iter().map(|list| list.member_count).sum::<u64>() as usize;
+    let mut users = HashMap::with_capacity(follower_ids.len() + friend_ids.len() + list_members);
+    let mut list_entries: HashMap<u64, (String, Vec<u64>)> = HashMap::with_capacity(lists.len());
 
     for list in lists {
-        list_names.insert(list.id, list.slug);
+        tracing::debug!(list_id = list.id, "loading list");
 
         let members = egg_mode::list::members(egg_mode::list::ListID::ID(list.id), &token)
             .with_page_size(5000)
@@ -473,9 +474,9 @@ async fn oneoff(
             .await
             .map_err(actix_web::error::ErrorInternalServerError)?;
 
-        for member in members.iter() {
-            list_members.entry(list.id).or_default().push(member.id);
-        }
+        let ids: Vec<_> = members.iter().map(|member| member.id).collect();
+        tracing::debug!(list_id = list.id, "found {} users in list", ids.len());
+        list_entries.insert(list.id, (list.slug, ids));
 
         users.extend(members.into_iter().map(|member| (member.id, member)));
     }
@@ -485,8 +486,8 @@ async fn oneoff(
 
     let chunks = follower_ids
         .iter()
-        .filter(|user_id| !listed_users.contains(user_id))
         .chain(friend_ids.iter())
+        .filter(|user_id| !listed_users.contains(user_id))
         .unique()
         .chunks(100);
     for (idx, chunk) in chunks.into_iter().enumerate() {
@@ -497,9 +498,7 @@ async fn oneoff(
             .await
             .map_err(actix_web::error::ErrorInternalServerError)?;
 
-        for user in resp.response {
-            users.insert(user.id, user);
-        }
+        users.extend(resp.response.into_iter().map(|user| (user.id, user)));
     }
     tracing::debug!("fetched information for {} users", users.len());
 
@@ -511,10 +510,14 @@ async fn oneoff(
         create_user_entry(&mut wtr, "followers.csv".to_string(), &users, &follower_ids).await;
         create_user_entry(&mut wtr, "friends.csv".to_string(), &users, &friend_ids).await;
 
-        for (id, slug) in list_names {
-            if let Some(members) = list_members.get(&id) {
-                create_user_entry(&mut wtr, format!("list-{id}-{slug}.csv"), &users, members).await;
-            }
+        for (id, (slug, member_ids)) in list_entries {
+            create_user_entry(
+                &mut wtr,
+                format!("list-{id}-{slug}.csv"),
+                &users,
+                &member_ids,
+            )
+            .await;
         }
 
         wtr.close().await.unwrap();
@@ -541,6 +544,7 @@ struct TwitterEntry<'a> {
     bio: Option<String>,
 }
 
+#[tracing::instrument(skip(wtr, users, ids))]
 async fn create_user_entry<W: tokio::io::AsyncWrite + Unpin>(
     wtr: &mut async_zip::write::ZipFileWriter<W>,
     name: String,
