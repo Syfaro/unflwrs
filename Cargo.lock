@@ -2645,7 +2645,7 @@ checksum = "dcf81ac59edc17cc8697ff311e8f5ef2d99fcbd9817b34cec66f90b6c3dfd987"
 
 [[package]]
 name = "unflwrs"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "actix-files",
  "actix-session",
