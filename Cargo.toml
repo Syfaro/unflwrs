@@ -27,6 +27,7 @@ itertools = "0.10.5"
 rand = "0.8.5"
 serde = { version = "1.0.147", features = ["derive"] }
 serde_json = "1.0.87"
+slug = "0.1.4"
 sqlx = { version = "0.6.1", features = ["runtime-actix-rustls", "postgres", "macros", "migrate", "chrono", "json", "offline"] }
 tokio = "1.21.2"
 tokio-stream = "0.1.11"
@@ -34,3 +35,4 @@ tokio-util = { version = "0.7.4", features = ["io", "io-util"] }
 tracing = "0.1.37"
 tracing-actix-web = "0.6.2"
 tracing-subscriber = "0.3.16"
+twitter-v2 = { git = "https://github.com/Syfaro/twitter-v2-rs.git", branch = "fix-url-entity", default-features = false, features = ["rustls-tls"] }

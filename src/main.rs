@@ -8,6 +8,14 @@ use clap::Parser;
 use futures::{StreamExt, TryFutureExt, TryStreamExt};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
+use twitter_v2::{
+    authorization::{Oauth2Client, Oauth2Token, Scope},
+    id::NumericId,
+    oauth2::{AuthorizationCode, CsrfToken, PkceCodeChallenge, PkceCodeVerifier},
+    prelude::{PaginableApiResponse, PaginationMeta},
+    query::{ListField, TweetField, UserExpansion, UserField},
+    TwitterApi,
+};
 
 #[derive(Clone, Parser)]
 struct Config {
@@ -22,12 +30,18 @@ struct Config {
     twitter_consumer_key: String,
     #[clap(long, env)]
     twitter_consumer_secret: String,
+
+    #[clap(long, env)]
+    twitter_client_id: String,
+    #[clap(long, env)]
+    twitter_client_secret: String,
 }
 
 struct Context {
     pool: sqlx::PgPool,
     kp: egg_mode::KeyPair,
     config: Config,
+    oauth2_client: Oauth2Client,
 }
 
 #[actix_web::main]
@@ -54,6 +68,14 @@ async fn main() {
         config.twitter_consumer_secret.clone(),
     );
 
+    let oauth_client = Oauth2Client::new(
+        config.twitter_client_id.clone(),
+        config.twitter_client_secret.clone(),
+        format!("{}/twitter/callback/v2", config.host_url)
+            .parse()
+            .unwrap(),
+    );
+
     refresh_stale_accounts(pool.clone(), kp.clone()).await;
 
     tracing::info!("starting server");
@@ -63,6 +85,7 @@ async fn main() {
             pool: pool.clone(),
             kp: kp.clone(),
             config: config.clone(),
+            oauth2_client: oauth_client.clone(),
         };
 
         let key = actix_web::cookie::Key::from(config.session_secret.as_bytes());
@@ -73,6 +96,7 @@ async fn main() {
             .service(home)
             .service(twitter_login)
             .service(twitter_callback)
+            .service(twitter_callback_v2)
             .service(feed)
             .service(feed_graph)
             .service(export_csv)
@@ -308,18 +332,40 @@ async fn twitter_login(
     sess: Session,
     form: web::Form<LoginForm>,
 ) -> Result<actix_web::HttpResponse, AppError> {
-    let request_token =
-        egg_mode::auth::request_token(&cx.kp, format!("{}/twitter/callback", cx.config.host_url))
-            .await?;
-    let auth_url = egg_mode::auth::authorize_url(&request_token);
+    let is_oneoff = form.oneoff.as_deref().unwrap_or_default() == "yes";
 
-    sess.insert("twitter-request-token", request_token)?;
-    if form.oneoff.as_deref().unwrap_or_default() == "yes" {
+    let location = if is_oneoff {
+        let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
+        let (url, state) = cx.oauth2_client.auth_url(
+            challenge,
+            [
+                Scope::TweetRead,
+                Scope::UsersRead,
+                Scope::FollowsRead,
+                Scope::ListRead,
+            ],
+        );
+
+        sess.insert("twitter-verifier", verifier)?;
+        sess.insert("twitter-state", state)?;
         sess.insert("oneoff", true)?;
-    }
+
+        url.as_str().to_string()
+    } else {
+        let request_token = egg_mode::auth::request_token(
+            &cx.kp,
+            format!("{}/twitter/callback", cx.config.host_url),
+        )
+        .await?;
+        let auth_url = egg_mode::auth::authorize_url(&request_token);
+
+        sess.insert("twitter-request-token", request_token)?;
+
+        auth_url
+    };
 
     Ok(actix_web::HttpResponse::Found()
-        .insert_header(("location", auth_url))
+        .insert_header(("location", location))
         .finish())
 }
 
@@ -401,6 +447,328 @@ async fn twitter_callback(
     Ok(HttpResponse::Found()
         .insert_header(("location", "/feed"))
         .finish())
+}
+
+#[derive(Deserialize)]
+struct TwitterCallbackV2Query {
+    code: AuthorizationCode,
+    state: CsrfToken,
+}
+
+#[get("/twitter/callback/v2")]
+async fn twitter_callback_v2(
+    cx: web::Data<Context>,
+    sess: Session,
+    query: web::Query<TwitterCallbackV2Query>,
+) -> actix_web::Result<actix_web::HttpResponse> {
+    let verifier: PkceCodeVerifier = sess
+        .get("twitter-verifier")?
+        .ok_or_else(|| actix_web::error::ErrorBadRequest("missing verifier"))?;
+
+    let twitter_state: CsrfToken = sess
+        .get("twitter-state")?
+        .ok_or_else(|| actix_web::error::ErrorBadRequest("missing state"))?;
+    if twitter_state.secret() != query.state.secret() {
+        return Err(actix_web::error::ErrorBadRequest("wrong state"));
+    }
+
+    let token = cx
+        .oauth2_client
+        .request_token(query.code.clone(), verifier)
+        .await
+        .map_err(actix_web::error::ErrorInternalServerError)?;
+
+    oneoff_v2(&cx.oauth2_client, token).await
+}
+
+#[tracing::instrument(skip(client, token))]
+async fn oneoff_v2(
+    client: &Oauth2Client,
+    mut token: Oauth2Token,
+) -> actix_web::Result<actix_web::HttpResponse> {
+    tracing::info!("starting oneoff v2");
+
+    client
+        .refresh_token_if_expired(&mut token)
+        .await
+        .map_err(actix_web::error::ErrorInternalServerError)?;
+    let api = TwitterApi::new(token);
+
+    let user_api = api
+        .with_user_ctx()
+        .await
+        .map_err(actix_web::error::ErrorInternalServerError)?;
+
+    let mut list_request = user_api.get_my_owned_lists();
+    list_request
+        .max_results(100)
+        .list_fields([ListField::MemberCount]);
+
+    let mut resp = list_request
+        .send()
+        .await
+        .map_err(actix_web::error::ErrorInternalServerError)?;
+
+    let mut lists = Vec::new();
+    if let Some(new_lists) = resp.data() {
+        lists.extend_from_slice(new_lists);
+    }
+
+    while matches!(resp.meta(), Some(meta) if meta.next_token().is_some()) {
+        resp = resp
+            .next_page()
+            .await
+            .map_err(actix_web::error::ErrorInternalServerError)?
+            .ok_or_else(|| actix_web::error::ErrorInternalServerError("next page did not exist"))?;
+
+        if let Some(new_lists) = resp.data() {
+            lists.extend_from_slice(new_lists);
+        }
+    }
+
+    let mut users: HashMap<NumericId, twitter_v2::User> = HashMap::new();
+
+    let mut list_members: HashMap<NumericId, (String, Vec<NumericId>)> =
+        HashMap::with_capacity(lists.len());
+    let mut pinned_tweets: HashMap<NumericId, twitter_v2::Tweet> = HashMap::new();
+
+    for list in lists {
+        tracing::debug!(list_id = %list.id, "getting members in list");
+
+        let mut member_request = api.get_list_members(list.id);
+        member_request
+            .max_results(100)
+            .expansions([UserExpansion::PinnedTweetId])
+            .user_fields([
+                UserField::Id,
+                UserField::Description,
+                UserField::Entities,
+                UserField::Location,
+                UserField::Name,
+                UserField::Url,
+                UserField::Username,
+                UserField::PinnedTweetId,
+            ])
+            .tweet_fields([TweetField::Entities, TweetField::Text]);
+
+        let mut resp = member_request
+            .send()
+            .await
+            .map_err(actix_web::error::ErrorInternalServerError)?;
+
+        if let Some(includes) = resp.includes() {
+            if let Some(tweets) = &includes.tweets {
+                pinned_tweets.extend(tweets.iter().map(|tweet| (tweet.id, tweet.clone())));
+            }
+        }
+
+        let mut members = Vec::with_capacity(list.member_count.unwrap_or_default());
+
+        if let Some(new_members) = resp.data() {
+            members.extend(new_members.iter().map(|member| member.id));
+            users.extend(new_members.iter().map(|member| (member.id, member.clone())));
+        }
+
+        while matches!(resp.meta(), Some(meta) if meta.next_token().is_some()) {
+            resp = resp
+                .next_page()
+                .await
+                .map_err(actix_web::error::ErrorInternalServerError)?
+                .ok_or_else(|| {
+                    actix_web::error::ErrorInternalServerError("next page did not exist")
+                })?;
+
+            if let Some(includes) = resp.includes() {
+                if let Some(tweets) = &includes.tweets {
+                    pinned_tweets.extend(tweets.iter().map(|tweet| (tweet.id, tweet.clone())));
+                }
+            }
+
+            if let Some(new_members) = resp.data() {
+                members.extend(new_members.iter().map(|member| member.id));
+                users.extend(new_members.iter().map(|member| (member.id, member.clone())));
+            }
+        }
+
+        tracing::debug!(list_id = %list.id, "found {} members in list", members.len());
+
+        list_members.insert(list.id, (slug::slugify(list.name), members));
+    }
+
+    tracing::trace!("found {} users in lists", users.len());
+
+    let mut following_req = user_api.get_my_following();
+    following_req
+        .max_results(1000)
+        .expansions([UserExpansion::PinnedTweetId])
+        .user_fields([
+            UserField::Id,
+            UserField::Description,
+            UserField::Entities,
+            UserField::Location,
+            UserField::Name,
+            UserField::Url,
+            UserField::Username,
+            UserField::PinnedTweetId,
+        ])
+        .tweet_fields([TweetField::Entities, TweetField::Text]);
+
+    let mut resp = following_req
+        .send()
+        .await
+        .map_err(actix_web::error::ErrorInternalServerError)?;
+
+    if let Some(includes) = resp.includes() {
+        if let Some(tweets) = &includes.tweets {
+            pinned_tweets.extend(tweets.iter().map(|tweet| (tweet.id, tweet.clone())));
+        }
+    }
+
+    let mut following_ids = Vec::new();
+    if let Some(new_following) = resp.data() {
+        following_ids.extend(new_following.iter().map(|following| following.id));
+        users.extend(
+            new_following
+                .iter()
+                .map(|member| (member.id, member.clone())),
+        );
+    }
+
+    while matches!(resp.meta(), Some(meta) if meta.next_token().is_some()) {
+        resp = resp
+            .next_page()
+            .await
+            .map_err(actix_web::error::ErrorInternalServerError)?
+            .ok_or_else(|| actix_web::error::ErrorInternalServerError("next page did not exist"))?;
+
+        if let Some(includes) = resp.includes() {
+            if let Some(tweets) = &includes.tweets {
+                pinned_tweets.extend(tweets.iter().map(|tweet| (tweet.id, tweet.clone())));
+            }
+        }
+
+        if let Some(new_following) = resp.data() {
+            following_ids.extend(new_following.iter().map(|following| following.id));
+            users.extend(
+                new_following
+                    .iter()
+                    .map(|member| (member.id, member.clone())),
+            );
+        }
+    }
+
+    tracing::debug!("found {} following", following_ids.len());
+
+    let mut follower_req = user_api.get_my_followers();
+    follower_req
+        .max_results(1000)
+        .expansions([UserExpansion::PinnedTweetId])
+        .user_fields([
+            UserField::Id,
+            UserField::Description,
+            UserField::Entities,
+            UserField::Location,
+            UserField::Name,
+            UserField::Url,
+            UserField::Username,
+            UserField::PinnedTweetId,
+        ])
+        .tweet_fields([TweetField::Entities, TweetField::Text]);
+
+    let mut resp = follower_req
+        .send()
+        .await
+        .map_err(actix_web::error::ErrorInternalServerError)?;
+
+    if let Some(includes) = resp.includes() {
+        if let Some(tweets) = &includes.tweets {
+            pinned_tweets.extend(tweets.iter().map(|tweet| (tweet.id, tweet.clone())));
+        }
+    }
+
+    let mut follower_ids = Vec::new();
+    if let Some(new_follower) = resp.data() {
+        follower_ids.extend(new_follower.iter().map(|follower| follower.id));
+        users.extend(
+            new_follower
+                .iter()
+                .map(|member| (member.id, member.clone())),
+        );
+    }
+
+    while matches!(resp.meta(), Some(meta) if meta.next_token().is_some()) {
+        resp = resp
+            .next_page()
+            .await
+            .map_err(actix_web::error::ErrorInternalServerError)?
+            .ok_or_else(|| actix_web::error::ErrorInternalServerError("next page did not exist"))?;
+
+        if let Some(includes) = resp.includes() {
+            if let Some(tweets) = &includes.tweets {
+                pinned_tweets.extend(tweets.iter().map(|tweet| (tweet.id, tweet.clone())));
+            }
+        }
+
+        if let Some(new_follower) = resp.data() {
+            follower_ids.extend(new_follower.iter().map(|follower| follower.id));
+            users.extend(
+                new_follower
+                    .iter()
+                    .map(|member| (member.id, member.clone())),
+            );
+        }
+    }
+
+    tracing::debug!("found {} followers", follower_ids.len());
+
+    tracing::debug!("discovered {} pinned tweets", pinned_tweets.len());
+
+    let (mut wtr, rdr) = tokio::io::duplex(1024);
+
+    tokio::task::spawn(async move {
+        let mut wtr = async_zip::write::ZipFileWriter::new(&mut wtr);
+
+        create_user_entry_v2(
+            &mut wtr,
+            "followers.csv".to_string(),
+            &users,
+            &pinned_tweets,
+            &follower_ids,
+        )
+        .await;
+        create_user_entry_v2(
+            &mut wtr,
+            "following.csv".to_string(),
+            &users,
+            &pinned_tweets,
+            &following_ids,
+        )
+        .await;
+
+        for (id, (slug, member_ids)) in list_members {
+            create_user_entry_v2(
+                &mut wtr,
+                format!("list-{id}-{slug}.csv"),
+                &users,
+                &pinned_tweets,
+                &member_ids,
+            )
+            .await;
+        }
+
+        wtr.close().await.unwrap();
+    });
+
+    let stream = tokio_util::codec::FramedRead::new(rdr, tokio_util::codec::BytesCodec::new())
+        .map_ok(|b| b.freeze());
+
+    Ok(HttpResponse::Ok()
+        .insert_header((
+            "content-disposition",
+            r#"attachment; filename="twitter-users.zip""#,
+        ))
+        .content_type("application/zip")
+        .streaming(stream))
 }
 
 #[get("/export/ff")]
@@ -542,6 +910,7 @@ struct TwitterEntry<'a> {
     website: Option<String>,
     location: Option<&'a str>,
     bio: Option<String>,
+    pinned_tweet: Option<String>,
 }
 
 #[tracing::instrument(skip(wtr, users, ids))]
@@ -595,6 +964,7 @@ async fn create_user_entry<W: tokio::io::AsyncWrite + Unpin>(
                     website: url,
                     location: user.location.as_deref(),
                     bio,
+                    pinned_tweet: None,
                 }
             }
             None => {
@@ -602,6 +972,116 @@ async fn create_user_entry<W: tokio::io::AsyncWrite + Unpin>(
 
                 TwitterEntry {
                     id,
+                    ..Default::default()
+                }
+            }
+        };
+
+        csv.serialize(row).await.unwrap();
+    }
+
+    let entry_writer = csv.into_inner().await.unwrap();
+    entry_writer.close().await.unwrap();
+}
+
+#[tracing::instrument(skip(wtr, users, ids))]
+async fn create_user_entry_v2<W: tokio::io::AsyncWrite + Unpin>(
+    wtr: &mut async_zip::write::ZipFileWriter<W>,
+    name: String,
+    users: &HashMap<NumericId, twitter_v2::User>,
+    pinned_tweets: &HashMap<NumericId, twitter_v2::Tweet>,
+    ids: &[NumericId],
+) {
+    let opts = async_zip::ZipEntryBuilder::new(name, async_zip::Compression::Deflate);
+    let entry_writer = wtr.write_entry_stream(opts).await.unwrap();
+    let mut csv = csv_async::AsyncSerializer::from_writer(entry_writer);
+
+    for id in ids.iter().copied() {
+        let row = match users.get(&id) {
+            Some(user) => {
+                let url = user.url.as_deref().map(|url| {
+                    let url_entities = user
+                        .entities
+                        .as_ref()
+                        .and_then(|entities| entities.url.as_ref())
+                        .and_then(|url_entities| url_entities.urls.as_ref());
+
+                    if let Some(url_entities) = url_entities {
+                        url_entities.iter().fold(url.to_string(), |url, entity| {
+                            if let Some(expanded_url) = entity.expanded_url.as_deref() {
+                                url.replace(&entity.url, expanded_url)
+                            } else {
+                                url
+                            }
+                        })
+                    } else {
+                        url.to_string()
+                    }
+                });
+
+                let bio = user.description.as_deref().map(|bio| {
+                    let url_entities = user
+                        .entities
+                        .as_ref()
+                        .and_then(|entities| entities.description.as_ref())
+                        .and_then(|description_entities| description_entities.urls.as_ref());
+
+                    if let Some(url_entities) = url_entities {
+                        url_entities.iter().fold(bio.to_string(), |bio, entity| {
+                            if let Some(expanded_url) = entity.expanded_url.as_deref() {
+                                bio.replace(&entity.url, expanded_url)
+                            } else {
+                                bio
+                            }
+                        })
+                    } else {
+                        bio.to_string()
+                    }
+                });
+
+                let pinned_tweet = if let Some(pinned_tweet_id) = user.pinned_tweet_id {
+                    match pinned_tweets.get(&pinned_tweet_id) {
+                        Some(pinned_tweet) => {
+                            let url_entities = pinned_tweet
+                                .entities
+                                .as_ref()
+                                .and_then(|entities| entities.urls.as_ref());
+
+                            if let Some(url_entities) = url_entities {
+                                Some(url_entities.iter().fold(
+                                    pinned_tweet.text.to_string(),
+                                    |text, entity| {
+                                        if let Some(expanded_url) = entity.expanded_url.as_deref() {
+                                            text.replace(&entity.url, expanded_url)
+                                        } else {
+                                            text
+                                        }
+                                    },
+                                ))
+                            } else {
+                                Some(pinned_tweet.text.to_string())
+                            }
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+
+                TwitterEntry {
+                    id: user.id.as_u64(),
+                    screen_name: Some(&user.username),
+                    website: url,
+                    location: user.location.as_deref(),
+                    bio,
+                    pinned_tweet,
+                }
+            }
+            None => {
+                tracing::warn!("user was not loaded: {id}");
+
+                TwitterEntry {
+                    id: id.as_u64(),
                     ..Default::default()
                 }
             }
