@@ -508,7 +508,7 @@ async fn oneoff(
         let mut wtr = async_zip::write::ZipFileWriter::new(&mut wtr);
 
         create_user_entry(&mut wtr, "followers.csv".to_string(), &users, &follower_ids).await;
-        create_user_entry(&mut wtr, "friends.csv".to_string(), &users, &friend_ids).await;
+        create_user_entry(&mut wtr, "following.csv".to_string(), &users, &friend_ids).await;
 
         for (id, (slug, member_ids)) in list_entries {
             create_user_entry(
