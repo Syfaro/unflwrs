@@ -1,4 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+};
 
 use actix_session::{storage::CookieSessionStore, Session, SessionMiddleware};
 use actix_web::{get, post, web, App, HttpResponse, HttpServer};
@@ -7,6 +10,7 @@ use async_zip::ZipEntryBuilderExt;
 use bytes::Bytes;
 use clap::Parser;
 use futures::{Future, StreamExt, TryFutureExt, TryStreamExt};
+use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 use twitter_v2::{
@@ -22,6 +26,9 @@ use twitter_v2::{
 struct Config {
     #[clap(long, env)]
     database_url: String,
+    #[clap(long, env)]
+    redis_url: String,
+
     #[clap(long, env)]
     host_url: String,
     #[clap(long, env)]
@@ -43,6 +50,7 @@ struct Context {
     kp: egg_mode::KeyPair,
     config: Config,
     oauth2_client: Oauth2Client,
+    redis: redis::aio::ConnectionManager,
 }
 
 #[actix_web::main]
@@ -77,6 +85,11 @@ async fn main() {
             .unwrap(),
     );
 
+    let redis_client =
+        redis::aio::ConnectionManager::new(redis::Client::open(config.redis_url.clone()).unwrap())
+            .await
+            .unwrap();
+
     refresh_stale_accounts(pool.clone(), kp.clone()).await;
 
     tracing::info!("starting server");
@@ -87,6 +100,7 @@ async fn main() {
             kp: kp.clone(),
             config: config.clone(),
             oauth2_client: oauth_client.clone(),
+            redis: redis_client.clone(),
         };
 
         let key = actix_web::cookie::Key::from(config.session_secret.as_bytes());
@@ -98,6 +112,8 @@ async fn main() {
             .service(twitter_login)
             .service(twitter_callback)
             .service(twitter_callback_v2)
+            .service(export_v2)
+            .service(export_events)
             .service(feed)
             .service(feed_graph)
             .service(export_csv)
@@ -447,6 +463,10 @@ struct TwitterCallbackV2Query {
     state: CsrfToken,
 }
 
+#[derive(Template)]
+#[template(path = "export.html")]
+struct ExportTemplate;
+
 #[get("/twitter/callback/v2")]
 async fn twitter_callback_v2(
     cx: web::Data<Context>,
@@ -470,13 +490,45 @@ async fn twitter_callback_v2(
         .await
         .map_err(actix_web::error::ErrorInternalServerError)?;
 
-    oneoff_v2(token).await
+    sess.insert("twitter-v2-token", &token)?;
+    sess.insert("csrf-token", generate_token(48))?;
+
+    let body = ExportTemplate
+        .render()
+        .map_err(actix_web::error::ErrorInternalServerError)?;
+    Ok(HttpResponse::Ok()
+        .insert_header(("content-type", "text/html"))
+        .body(body))
 }
 
-#[tracing::instrument(skip(token), fields(user_id))]
-async fn oneoff_v2(token: Oauth2Token) -> actix_web::Result<actix_web::HttpResponse> {
+#[get("/export/v2")]
+async fn export_v2(
+    cx: web::Data<Context>,
+    sess: Session,
+) -> actix_web::Result<actix_web::HttpResponse> {
+    let session_name = sess
+        .get("csrf-token")?
+        .ok_or_else(|| actix_web::error::ErrorBadRequest("missing session name"))?;
+
+    let token = sess
+        .get("twitter-v2-token")?
+        .ok_or_else(|| actix_web::error::ErrorUnauthorized("missing token"))?;
+
+    oneoff_v2(cx.redis.clone(), session_name, token).await
+}
+
+#[tracing::instrument(skip(redis, session_name, token), fields(user_id))]
+async fn oneoff_v2(
+    mut redis: redis::aio::ConnectionManager,
+    session_name: String,
+    token: Oauth2Token,
+) -> actix_web::Result<actix_web::HttpResponse> {
+    let channel = format!("unflwrs:export:{session_name}");
+
     tracing::info!("starting oneoff v2");
     let api = TwitterApi::new(token);
+
+    publish_event(&mut redis, &channel, ExportEvent::Started).await;
 
     let user_id = api
         .get_users_me()
@@ -493,8 +545,16 @@ async fn oneoff_v2(token: Oauth2Token) -> actix_web::Result<actix_web::HttpRespo
 
     tokio::task::spawn(
         async move {
-            if let Err(err) = write_zips(wtr, api, user_id).await {
+            if let Err(err) = write_zips(&mut redis, wtr, api, user_id, &channel).await {
                 tracing::error!("could not finish zip: {err}");
+                publish_event(
+                    &mut redis,
+                    &channel,
+                    ExportEvent::Error {
+                        message: err.into(),
+                    },
+                )
+                .await;
             }
         }
         .in_current_span(),
@@ -510,6 +570,70 @@ async fn oneoff_v2(token: Oauth2Token) -> actix_web::Result<actix_web::HttpRespo
         ))
         .content_type("application/zip")
         .streaming(stream))
+}
+
+#[derive(PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "event", content = "data")]
+enum ExportEvent {
+    Started,
+    Message { text: Cow<'static, str> },
+    Error { message: Cow<'static, str> },
+    Completed,
+}
+
+impl ExportEvent {
+    fn message<S>(text: S) -> Self
+    where
+        S: Into<Cow<'static, str>>,
+    {
+        Self::Message { text: text.into() }
+    }
+}
+
+#[get("/export/events")]
+async fn export_events(
+    cx: web::Data<Context>,
+    sess: Session,
+) -> actix_web::Result<impl actix_web::Responder> {
+    let session_name: String = sess
+        .get("csrf-token")?
+        .ok_or_else(|| actix_web::error::ErrorBadRequest("missing session name"))?;
+    let channel = format!("unflwrs:export:{session_name}");
+
+    let redis = redis::Client::open(cx.config.redis_url.clone())
+        .map_err(actix_web::error::ErrorInternalServerError)?;
+
+    let (tx, rx) = actix_web_lab::sse::channel(1);
+
+    tokio::task::spawn(
+        async move {
+            tracing::debug!("starting pubsub");
+            let mut sub = redis.get_async_connection().await.unwrap().into_pubsub();
+            sub.subscribe(channel).await.unwrap();
+
+            while let Some(message) = sub.on_message().next().await {
+                let payload = message.get_payload::<Vec<u8>>().unwrap();
+                let event: ExportEvent = serde_json::from_slice(&payload).unwrap();
+
+                tx.send(actix_web_lab::sse::Event::Data(
+                    actix_web_lab::sse::Data::new_json(&event)
+                        .unwrap()
+                        .event("progress"),
+                ))
+                .await
+                .unwrap();
+
+                if event == ExportEvent::Completed {
+                    tracing::info!("got completed event, ending");
+                    drop(tx);
+                    return;
+                }
+            }
+        }
+        .in_current_span(),
+    );
+
+    Ok(rx)
 }
 
 #[tracing::instrument(skip(f))]
@@ -587,11 +711,22 @@ fn merge_expansions(
     merge_expansion_field!(expansions, new_expansions, places);
 }
 
+async fn publish_event(
+    redis: &mut redis::aio::ConnectionManager,
+    channel: &str,
+    event: ExportEvent,
+) {
+    let event = serde_json::to_vec(&event).unwrap();
+    let _ = redis.publish::<_, _, ()>(channel, event).await;
+}
+
 async fn write_zips<W, A>(
+    client: &mut redis::aio::ConnectionManager,
     wtr: W,
     api: twitter_v2::TwitterApi<A>,
     user_id: NumericId,
-) -> Result<(), actix_web::Error>
+    channel: &str,
+) -> Result<(), String>
 where
     W: tokio::io::AsyncWrite + Unpin,
     A: Send + Sync + twitter_v2::Authorization,
@@ -600,6 +735,7 @@ where
     let mut wtr = async_zip::write::ZipFileWriter::new(wtr);
 
     tracing::debug!("loading following");
+    publish_event(client, channel, ExportEvent::message("loading following")).await;
     let mut following_req = api.get_user_following(user_id);
     following_req
         .max_results(1000)
@@ -618,7 +754,7 @@ where
 
     let (following, expansions) = fetch_all(|| following_req.send())
         .await
-        .map_err(actix_web::error::ErrorInternalServerError)?;
+        .map_err(|err| err.to_string())?;
 
     create_user_entry_v2(
         &mut wtr,
@@ -629,6 +765,7 @@ where
     .await;
 
     tracing::debug!("loading followers");
+    publish_event(client, channel, ExportEvent::message("loading followers")).await;
     let mut follower_req = api.get_user_followers(user_id);
     follower_req
         .max_results(1000)
@@ -647,7 +784,7 @@ where
 
     let (followers, expansions) = fetch_all(|| follower_req.send())
         .await
-        .map_err(actix_web::error::ErrorInternalServerError)?;
+        .map_err(|err| err.to_string())?;
 
     create_user_entry_v2(
         &mut wtr,
@@ -665,10 +802,17 @@ where
 
     let (lists, _expansions) = fetch_all(|| list_request.send())
         .await
-        .map_err(actix_web::error::ErrorInternalServerError)?;
+        .map_err(|err| err.to_string())?;
 
     for list in lists {
         tracing::debug!(list_id = %list.id, "loading list");
+        publish_event(
+            client,
+            channel,
+            ExportEvent::message(format!("loading list: {}", list.name)),
+        )
+        .await;
+
         let mut member_request = api.get_list_members(list.id);
         member_request
             .max_results(100)
@@ -687,7 +831,7 @@ where
 
         let (members, expansions) = fetch_all(|| member_request.send())
             .await
-            .map_err(actix_web::error::ErrorInternalServerError)?;
+            .map_err(|err| err.to_string())?;
 
         create_user_entry_v2(
             &mut wtr,
@@ -700,6 +844,8 @@ where
 
     wtr.close().await.unwrap();
     tracing::info!("finished writing zip");
+
+    publish_event(client, channel, ExportEvent::Completed).await;
 
     Ok(())
 }

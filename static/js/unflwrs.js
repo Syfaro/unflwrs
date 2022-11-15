@@ -45,49 +45,6 @@ if (document.querySelector('h2[data-missing="yes"]')) {
   }, 60 * 1000);
 }
 
-// if (document.querySelector('main[data-page="feed"]')) {
-//   displayGraph().then(() => console.log('Updated graph'));
-// }
-
-async function displayGraph() {
-  const resp = await fetch('/feed/graph');
-  const data = await resp.json();
-
-  if (data.length < 2) {
-    console.debug('Not enough data for graph');
-    return;
-  }
-
-  const entries = data.map((row) => {
-    return {
-      x: new Date(row[0] * 1000),
-      y: row[1],
-    }
-  });
-
-  console.debug(entries);
-
-  new Chartist.Line('.ct-chart', {
-    series: [
-      {
-        name: 'followers',
-        data: entries,
-      }
-    ]
-  }, {
-    axisY: {
-      onlyInteger: true
-    },
-    axisX: {
-      type: Chartist.FixedScaleAxis,
-      divisor: 5,
-      labelInterpolationFnc: function (value) {
-        rtf.format(value, 'days');
-      }
-    }
-  })
-}
-
 const deleteAccountBtn = document.getElementById('delete-account');
 if (deleteAccountBtn) {
   deleteAccountBtn.addEventListener('click', (ev) => {
@@ -116,4 +73,62 @@ if (deleteAccountBtn) {
       deleteAccountBtn.removeAttribute('aria-busy');
     }
   })
+}
+
+if (document.querySelector('main[data-page="export"]')) {
+  const startButton = document.getElementById('start-button');
+  const exportEvents = document.getElementById('export-events');
+
+  startButton.addEventListener('click', () => {
+    startButton.setAttribute('aria-busy', 'true');
+  });
+
+  const sse = new EventSource('/export/events');
+
+  function endExport(sse, startButton) {
+    sse.close();
+
+    startButton.removeAttribute('aria-busy');
+    startButton.setAttribute('disabled', 'true');
+    startButton.classList.add('outline', 'secondary');
+    startButton.replaceChildren(document.createTextNode('finished'));
+  }
+
+  sse.addEventListener('open', () => {
+    exportEvents.replaceChildren();
+  });
+
+  sse.addEventListener('progress', (ev) => {
+    console.debug(ev);
+
+    var eventText;
+
+    const data = JSON.parse(ev.data);
+    switch (data['event']) {
+      case 'started':
+        eventText = 'export started';
+        break;
+      case 'message':
+        eventText = data['data']['text'];
+        break;
+      case 'error':
+        alert(`error! ${data['data']['message']}`);
+        endExport(sse, startButton);
+        return;
+      case 'completed':
+        eventText = 'completed';
+        endExport(sse, startButton);
+        break;
+    }
+
+    const elem = document.createElement('p');
+    elem.appendChild(document.createTextNode(eventText));
+    exportEvents.prepend(elem);
+  });
+
+  sse.addEventListener('close', () => {
+    console.log('closed sse');
+
+    endExport(sse, startButton);
+  });
 }

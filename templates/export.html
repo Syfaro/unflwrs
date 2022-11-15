@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+
+{% block content %}
+<header class="container">
+    <h1>friends &amp; followers export</h1>
+
+    <a href="/export/v2" role="button" download id="start-button">start</a>
+</header>
+
+<main class="container" data-page="export">
+    <div id="export-events">
+        <p>waiting for start&hellip;</p>
+    </div>
+</main>
+{% endblock %}
