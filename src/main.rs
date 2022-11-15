@@ -540,6 +540,8 @@ async fn oneoff_v2(
     tracing::Span::current().record("user_id", user.id.as_u64());
     tracing::debug!("found user");
 
+    let username = user.username.clone();
+
     let (wtr, rdr) = tokio::io::duplex(1024);
 
     tokio::task::spawn(
@@ -565,7 +567,7 @@ async fn oneoff_v2(
     Ok(HttpResponse::Ok()
         .insert_header((
             "content-disposition",
-            r#"attachment; filename="twitter-users.zip""#,
+            format!(r#"attachment; filename="twitter-users-{username}.zip""#),
         ))
         .content_type("application/zip")
         .streaming(stream))
