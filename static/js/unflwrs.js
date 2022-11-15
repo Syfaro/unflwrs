@@ -81,6 +81,7 @@ if (document.querySelector('main[data-page="export"]')) {
 
   startButton.addEventListener('click', () => {
     startButton.setAttribute('aria-busy', 'true');
+    startButton.replaceChildren(document.createTextNode('working'));
   });
 
   const sse = new EventSource('/export/events');

@@ -15,7 +15,6 @@ use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 use twitter_v2::{
     authorization::{Oauth2Client, Oauth2Token, Scope},
-    id::NumericId,
     oauth2::{AuthorizationCode, CsrfToken, PkceCodeChallenge, PkceCodeVerifier},
     prelude::PaginableApiResponse,
     query::{ListField, TweetField, UserExpansion, UserField},
@@ -530,22 +529,22 @@ async fn oneoff_v2(
 
     publish_event(&mut redis, &channel, ExportEvent::Started).await;
 
-    let user_id = api
+    let user = api
         .get_users_me()
+        .user_fields([UserField::PublicMetrics])
         .send()
         .await
         .map_err(actix_web::error::ErrorInternalServerError)?
         .into_data()
-        .unwrap()
-        .id;
-    tracing::Span::current().record("user_id", user_id.as_u64());
+        .unwrap();
+    tracing::Span::current().record("user_id", user.id.as_u64());
     tracing::debug!("found user");
 
     let (wtr, rdr) = tokio::io::duplex(1024);
 
     tokio::task::spawn(
         async move {
-            if let Err(err) = write_zips(&mut redis, wtr, api, user_id, &channel).await {
+            if let Err(err) = write_zips(&mut redis, wtr, api, user, &channel).await {
                 tracing::error!("could not finish zip: {err}");
                 publish_event(
                     &mut redis,
@@ -724,7 +723,7 @@ async fn write_zips<W, A>(
     client: &mut redis::aio::ConnectionManager,
     wtr: W,
     api: twitter_v2::TwitterApi<A>,
-    user_id: NumericId,
+    user: twitter_v2::User,
     channel: &str,
 ) -> Result<(), String>
 where
@@ -734,68 +733,100 @@ where
     tracing::debug!("starting zip writer");
     let mut wtr = async_zip::write::ZipFileWriter::new(wtr);
 
-    tracing::debug!("loading following");
-    publish_event(client, channel, ExportEvent::message("loading following")).await;
-    let mut following_req = api.get_user_following(user_id);
-    following_req
-        .max_results(1000)
-        .expansions([UserExpansion::PinnedTweetId])
-        .user_fields([
-            UserField::Id,
-            UserField::Description,
-            UserField::Entities,
-            UserField::Location,
-            UserField::Name,
-            UserField::Url,
-            UserField::Username,
-            UserField::PinnedTweetId,
-        ])
-        .tweet_fields([TweetField::Entities, TweetField::Text]);
+    if user
+        .public_metrics
+        .as_ref()
+        .map(|metrics| metrics.following_count)
+        .unwrap_or_default()
+        > 15_000
+    {
+        tracing::warn!("user following more than 15,000");
+        publish_event(
+            client,
+            channel,
+            ExportEvent::message("skipping following, greater than 15,000"),
+        )
+        .await;
+    } else {
+        tracing::debug!("loading following");
+        publish_event(client, channel, ExportEvent::message("loading following")).await;
+        let mut following_req = api.get_user_following(user.id);
+        following_req
+            .max_results(1000)
+            .expansions([UserExpansion::PinnedTweetId])
+            .user_fields([
+                UserField::Id,
+                UserField::Description,
+                UserField::Entities,
+                UserField::Location,
+                UserField::Name,
+                UserField::Url,
+                UserField::Username,
+                UserField::PinnedTweetId,
+            ])
+            .tweet_fields([TweetField::Entities, TweetField::Text]);
 
-    let (following, expansions) = fetch_all(|| following_req.send())
-        .await
-        .map_err(|err| err.to_string())?;
+        let (following, expansions) = fetch_all(|| following_req.send())
+            .await
+            .map_err(|err| err.to_string())?;
 
-    create_user_entry_v2(
-        &mut wtr,
-        "following.csv".to_string(),
-        following,
-        expansions.tweets.unwrap_or_default(),
-    )
-    .await;
+        create_user_entry_v2(
+            &mut wtr,
+            "following.csv".to_string(),
+            following,
+            expansions.tweets.unwrap_or_default(),
+        )
+        .await;
+    }
 
-    tracing::debug!("loading followers");
-    publish_event(client, channel, ExportEvent::message("loading followers")).await;
-    let mut follower_req = api.get_user_followers(user_id);
-    follower_req
-        .max_results(1000)
-        .expansions([UserExpansion::PinnedTweetId])
-        .user_fields([
-            UserField::Id,
-            UserField::Description,
-            UserField::Entities,
-            UserField::Location,
-            UserField::Name,
-            UserField::Url,
-            UserField::Username,
-            UserField::PinnedTweetId,
-        ])
-        .tweet_fields([TweetField::Entities, TweetField::Text]);
+    if user
+        .public_metrics
+        .as_ref()
+        .map(|metrics| metrics.followers_count)
+        .unwrap_or_default()
+        > 15_000
+    {
+        tracing::warn!("user followers more than 15,000");
+        publish_event(
+            client,
+            channel,
+            ExportEvent::message("skipping followers, greater than 15,000"),
+        )
+        .await;
+    } else {
+        tracing::debug!("loading followers");
+        publish_event(client, channel, ExportEvent::message("loading followers")).await;
+        let mut follower_req = api.get_user_followers(user.id);
+        follower_req
+            .max_results(1000)
+            .expansions([UserExpansion::PinnedTweetId])
+            .user_fields([
+                UserField::Id,
+                UserField::Description,
+                UserField::Entities,
+                UserField::Location,
+                UserField::Name,
+                UserField::Url,
+                UserField::Username,
+                UserField::PinnedTweetId,
+            ])
+            .tweet_fields([TweetField::Entities, TweetField::Text]);
 
-    let (followers, expansions) = fetch_all(|| follower_req.send())
-        .await
-        .map_err(|err| err.to_string())?;
+        let (followers, expansions) = fetch_all(|| follower_req.send())
+            .await
+            .map_err(|err| err.to_string())?;
 
-    create_user_entry_v2(
-        &mut wtr,
-        "followers.csv".to_string(),
-        followers,
-        expansions.tweets.unwrap_or_default(),
-    )
-    .await;
+        create_user_entry_v2(
+            &mut wtr,
+            "followers.csv".to_string(),
+            followers,
+            expansions.tweets.unwrap_or_default(),
+        )
+        .await;
+    }
 
     tracing::debug!("loading lists");
-    let mut list_request = api.get_user_owned_lists(user_id);
+    let mut list_request = api.get_user_owned_lists(user.id);
     list_request
         .max_results(100)
         .list_fields([ListField::MemberCount]);
