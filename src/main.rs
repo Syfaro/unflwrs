@@ -489,155 +489,13 @@ async fn oneoff_v2(token: Oauth2Token) -> actix_web::Result<actix_web::HttpRespo
     tracing::Span::current().record("user_id", user_id.as_u64());
     tracing::debug!("found user");
 
-    let mut list_request = api.get_user_owned_lists(user_id);
-    list_request
-        .max_results(100)
-        .list_fields([ListField::MemberCount]);
-
-    let (lists, _expansions) = fetch_all(|| list_request.send())
-        .await
-        .map_err(actix_web::error::ErrorInternalServerError)?;
-
-    let mut users: HashMap<NumericId, twitter_v2::User> = HashMap::new();
-    let mut list_members: HashMap<NumericId, (String, Vec<NumericId>)> =
-        HashMap::with_capacity(lists.len());
-    let mut pinned_tweets: HashMap<NumericId, twitter_v2::Tweet> = HashMap::new();
-
-    for list in lists {
-        tracing::debug!(list_id = %list.id, "getting members in list");
-
-        let mut member_request = api.get_list_members(list.id);
-        member_request
-            .max_results(100)
-            .expansions([UserExpansion::PinnedTweetId])
-            .user_fields([
-                UserField::Id,
-                UserField::Description,
-                UserField::Entities,
-                UserField::Location,
-                UserField::Name,
-                UserField::Url,
-                UserField::Username,
-                UserField::PinnedTweetId,
-            ])
-            .tweet_fields([TweetField::Entities, TweetField::Text]);
-
-        let (members, expansions) = fetch_all(|| member_request.send())
-            .await
-            .map_err(actix_web::error::ErrorInternalServerError)?;
-
-        list_members.insert(
-            list.id,
-            (
-                slug::slugify(list.name),
-                members.iter().map(|user| user.id).collect(),
-            ),
-        );
-        users.extend(members.into_iter().map(|user| (user.id, user)));
-
-        if let Some(tweets) = expansions.tweets {
-            pinned_tweets.extend(tweets.into_iter().map(|tweet| (tweet.id, tweet)));
-        }
-    }
-
-    tracing::debug!("found {} users in lists", users.len());
-
-    let mut following_req = api.get_user_following(user_id);
-    following_req
-        .max_results(1000)
-        .expansions([UserExpansion::PinnedTweetId])
-        .user_fields([
-            UserField::Id,
-            UserField::Description,
-            UserField::Entities,
-            UserField::Location,
-            UserField::Name,
-            UserField::Url,
-            UserField::Username,
-            UserField::PinnedTweetId,
-        ])
-        .tweet_fields([TweetField::Entities, TweetField::Text]);
-
-    let (following, expansions) = fetch_all(|| following_req.send())
-        .await
-        .map_err(actix_web::error::ErrorInternalServerError)?;
-
-    let following_ids: Vec<_> = following.iter().map(|user| user.id).collect();
-    users.extend(following.into_iter().map(|user| (user.id, user)));
-
-    if let Some(tweets) = expansions.tweets {
-        pinned_tweets.extend(tweets.into_iter().map(|tweet| (tweet.id, tweet)));
-    }
-
-    tracing::debug!("found {} following", following_ids.len());
-
-    let mut follower_req = api.get_user_followers(user_id);
-    follower_req
-        .max_results(1000)
-        .expansions([UserExpansion::PinnedTweetId])
-        .user_fields([
-            UserField::Id,
-            UserField::Description,
-            UserField::Entities,
-            UserField::Location,
-            UserField::Name,
-            UserField::Url,
-            UserField::Username,
-            UserField::PinnedTweetId,
-        ])
-        .tweet_fields([TweetField::Entities, TweetField::Text]);
-
-    let (followers, expansions) = fetch_all(|| follower_req.send())
-        .await
-        .map_err(actix_web::error::ErrorInternalServerError)?;
-
-    let follower_ids: Vec<_> = followers.iter().map(|user| user.id).collect();
-    users.extend(followers.into_iter().map(|user| (user.id, user)));
-
-    if let Some(tweets) = expansions.tweets {
-        pinned_tweets.extend(tweets.into_iter().map(|tweet| (tweet.id, tweet)));
-    }
-
-    tracing::debug!("found {} followers", follower_ids.len());
-    tracing::debug!("discovered {} pinned tweets", pinned_tweets.len());
-
-    let (mut wtr, rdr) = tokio::io::duplex(1024);
+    let (wtr, rdr) = tokio::io::duplex(1024);
 
     tokio::task::spawn(
         async move {
-            tracing::debug!("starting zip writer");
-            let mut wtr = async_zip::write::ZipFileWriter::new(&mut wtr);
-
-            create_user_entry_v2(
-                &mut wtr,
-                "followers.csv".to_string(),
-                &users,
-                &pinned_tweets,
-                &follower_ids,
-            )
-            .await;
-            create_user_entry_v2(
-                &mut wtr,
-                "following.csv".to_string(),
-                &users,
-                &pinned_tweets,
-                &following_ids,
-            )
-            .await;
-
-            for (id, (slug, member_ids)) in list_members {
-                create_user_entry_v2(
-                    &mut wtr,
-                    format!("list-{id}-{slug}.csv"),
-                    &users,
-                    &pinned_tweets,
-                    &member_ids,
-                )
-                .await;
+            if let Err(err) = write_zips(wtr, api, user_id).await {
+                tracing::error!("could not finish zip: {err}");
             }
-
-            wtr.close().await.unwrap();
-            tracing::info!("finished writing zip");
         }
         .in_current_span(),
     );
@@ -729,6 +587,123 @@ fn merge_expansions(
     merge_expansion_field!(expansions, new_expansions, places);
 }
 
+async fn write_zips<W, A>(
+    wtr: W,
+    api: twitter_v2::TwitterApi<A>,
+    user_id: NumericId,
+) -> Result<(), actix_web::Error>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    A: Send + Sync + twitter_v2::Authorization,
+{
+    tracing::debug!("starting zip writer");
+    let mut wtr = async_zip::write::ZipFileWriter::new(wtr);
+
+    tracing::debug!("loading following");
+    let mut following_req = api.get_user_following(user_id);
+    following_req
+        .max_results(1000)
+        .expansions([UserExpansion::PinnedTweetId])
+        .user_fields([
+            UserField::Id,
+            UserField::Description,
+            UserField::Entities,
+            UserField::Location,
+            UserField::Name,
+            UserField::Url,
+            UserField::Username,
+            UserField::PinnedTweetId,
+        ])
+        .tweet_fields([TweetField::Entities, TweetField::Text]);
+
+    let (following, expansions) = fetch_all(|| following_req.send())
+        .await
+        .map_err(actix_web::error::ErrorInternalServerError)?;
+
+    create_user_entry_v2(
+        &mut wtr,
+        "following.csv".to_string(),
+        following,
+        expansions.tweets.unwrap_or_default(),
+    )
+    .await;
+
+    tracing::debug!("loading followers");
+    let mut follower_req = api.get_user_followers(user_id);
+    follower_req
+        .max_results(1000)
+        .expansions([UserExpansion::PinnedTweetId])
+        .user_fields([
+            UserField::Id,
+            UserField::Description,
+            UserField::Entities,
+            UserField::Location,
+            UserField::Name,
+            UserField::Url,
+            UserField::Username,
+            UserField::PinnedTweetId,
+        ])
+        .tweet_fields([TweetField::Entities, TweetField::Text]);
+
+    let (followers, expansions) = fetch_all(|| follower_req.send())
+        .await
+        .map_err(actix_web::error::ErrorInternalServerError)?;
+
+    create_user_entry_v2(
+        &mut wtr,
+        "followers.csv".to_string(),
+        followers,
+        expansions.tweets.unwrap_or_default(),
+    )
+    .await;
+
+    tracing::debug!("loading lists");
+    let mut list_request = api.get_user_owned_lists(user_id);
+    list_request
+        .max_results(100)
+        .list_fields([ListField::MemberCount]);
+
+    let (lists, _expansions) = fetch_all(|| list_request.send())
+        .await
+        .map_err(actix_web::error::ErrorInternalServerError)?;
+
+    for list in lists {
+        tracing::debug!(list_id = %list.id, "loading list");
+        let mut member_request = api.get_list_members(list.id);
+        member_request
+            .max_results(100)
+            .expansions([UserExpansion::PinnedTweetId])
+            .user_fields([
+                UserField::Id,
+                UserField::Description,
+                UserField::Entities,
+                UserField::Location,
+                UserField::Name,
+                UserField::Url,
+                UserField::Username,
+                UserField::PinnedTweetId,
+            ])
+            .tweet_fields([TweetField::Entities, TweetField::Text]);
+
+        let (members, expansions) = fetch_all(|| member_request.send())
+            .await
+            .map_err(actix_web::error::ErrorInternalServerError)?;
+
+        create_user_entry_v2(
+            &mut wtr,
+            format!("list-{}-{}.csv", list.id, slug::slugify(list.name)),
+            members,
+            expansions.tweets.unwrap_or_default(),
+        )
+        .await;
+    }
+
+    wtr.close().await.unwrap();
+    tracing::info!("finished writing zip");
+
+    Ok(())
+}
+
 #[derive(Template)]
 #[template(path = "ff_message.html")]
 struct FFMessageTemplate;
@@ -763,108 +738,101 @@ struct TwitterEntry<'a> {
     pinned_tweet: Option<String>,
 }
 
-#[tracing::instrument(skip(wtr, users, pinned_tweets, ids))]
+#[tracing::instrument(skip(wtr, users, pinned_tweets))]
 async fn create_user_entry_v2<W: tokio::io::AsyncWrite + Unpin>(
     wtr: &mut async_zip::write::ZipFileWriter<W>,
     name: String,
-    users: &HashMap<NumericId, twitter_v2::User>,
-    pinned_tweets: &HashMap<NumericId, twitter_v2::Tweet>,
-    ids: &[NumericId],
+    users: Vec<twitter_v2::User>,
+    pinned_tweets: Vec<twitter_v2::Tweet>,
 ) {
+    tracing::debug!("starting entry with {} users", users.len());
     let opts = async_zip::ZipEntryBuilder::new(name, async_zip::Compression::Deflate)
         .unix_permissions(777);
     let entry_writer = wtr.write_entry_stream(opts).await.unwrap();
     let mut csv = csv_async::AsyncSerializer::from_writer(entry_writer);
 
-    for id in ids.iter().copied() {
-        let row = match users.get(&id) {
-            Some(user) => {
-                let url = user.url.as_deref().map(|url| {
-                    let url_entities = user
+    let pinned_tweets: HashMap<_, _> = pinned_tweets
+        .into_iter()
+        .map(|tweet| (tweet.id, tweet))
+        .collect();
+
+    for user in users {
+        let url = user.url.as_deref().map(|url| {
+            let url_entities = user
+                .entities
+                .as_ref()
+                .and_then(|entities| entities.url.as_ref())
+                .and_then(|url_entities| url_entities.urls.as_ref());
+
+            if let Some(url_entities) = url_entities {
+                url_entities.iter().fold(url.to_string(), |url, entity| {
+                    if let Some(expanded_url) = entity.expanded_url.as_deref() {
+                        url.replace(&entity.url, expanded_url)
+                    } else {
+                        url
+                    }
+                })
+            } else {
+                url.to_string()
+            }
+        });
+
+        let bio = user.description.as_deref().map(|bio| {
+            let url_entities = user
+                .entities
+                .as_ref()
+                .and_then(|entities| entities.description.as_ref())
+                .and_then(|description_entities| description_entities.urls.as_ref());
+
+            if let Some(url_entities) = url_entities {
+                url_entities.iter().fold(bio.to_string(), |bio, entity| {
+                    if let Some(expanded_url) = entity.expanded_url.as_deref() {
+                        bio.replace(&entity.url, expanded_url)
+                    } else {
+                        bio
+                    }
+                })
+            } else {
+                bio.to_string()
+            }
+        });
+
+        let pinned_tweet = if let Some(pinned_tweet_id) = user.pinned_tweet_id {
+            match pinned_tweets.get(&pinned_tweet_id) {
+                Some(pinned_tweet) => {
+                    let url_entities = pinned_tweet
                         .entities
                         .as_ref()
-                        .and_then(|entities| entities.url.as_ref())
-                        .and_then(|url_entities| url_entities.urls.as_ref());
+                        .and_then(|entities| entities.urls.as_ref());
 
                     if let Some(url_entities) = url_entities {
-                        url_entities.iter().fold(url.to_string(), |url, entity| {
-                            if let Some(expanded_url) = entity.expanded_url.as_deref() {
-                                url.replace(&entity.url, expanded_url)
-                            } else {
-                                url
-                            }
-                        })
+                        Some(url_entities.iter().fold(
+                            pinned_tweet.text.to_string(),
+                            |text, entity| {
+                                if let Some(expanded_url) = entity.expanded_url.as_deref() {
+                                    text.replace(&entity.url, expanded_url)
+                                } else {
+                                    text
+                                }
+                            },
+                        ))
                     } else {
-                        url.to_string()
+                        Some(pinned_tweet.text.to_string())
                     }
-                });
-
-                let bio = user.description.as_deref().map(|bio| {
-                    let url_entities = user
-                        .entities
-                        .as_ref()
-                        .and_then(|entities| entities.description.as_ref())
-                        .and_then(|description_entities| description_entities.urls.as_ref());
-
-                    if let Some(url_entities) = url_entities {
-                        url_entities.iter().fold(bio.to_string(), |bio, entity| {
-                            if let Some(expanded_url) = entity.expanded_url.as_deref() {
-                                bio.replace(&entity.url, expanded_url)
-                            } else {
-                                bio
-                            }
-                        })
-                    } else {
-                        bio.to_string()
-                    }
-                });
-
-                let pinned_tweet = if let Some(pinned_tweet_id) = user.pinned_tweet_id {
-                    match pinned_tweets.get(&pinned_tweet_id) {
-                        Some(pinned_tweet) => {
-                            let url_entities = pinned_tweet
-                                .entities
-                                .as_ref()
-                                .and_then(|entities| entities.urls.as_ref());
-
-                            if let Some(url_entities) = url_entities {
-                                Some(url_entities.iter().fold(
-                                    pinned_tweet.text.to_string(),
-                                    |text, entity| {
-                                        if let Some(expanded_url) = entity.expanded_url.as_deref() {
-                                            text.replace(&entity.url, expanded_url)
-                                        } else {
-                                            text
-                                        }
-                                    },
-                                ))
-                            } else {
-                                Some(pinned_tweet.text.to_string())
-                            }
-                        }
-                        _ => None,
-                    }
-                } else {
-                    None
-                };
-
-                TwitterEntry {
-                    id: user.id.as_u64(),
-                    screen_name: Some(&user.username),
-                    website: url,
-                    location: user.location.as_deref(),
-                    bio,
-                    pinned_tweet,
                 }
+                _ => None,
             }
-            None => {
-                tracing::warn!("user was not loaded: {id}");
+        } else {
+            None
+        };
 
-                TwitterEntry {
-                    id: id.as_u64(),
-                    ..Default::default()
-                }
-            }
+        let row = TwitterEntry {
+            id: user.id.as_u64(),
+            screen_name: Some(&user.username),
+            website: url,
+            location: user.location.as_deref(),
+            bio,
+            pinned_tweet,
         };
 
         csv.serialize(row).await.unwrap();
@@ -872,6 +840,7 @@ async fn create_user_entry_v2<W: tokio::io::AsyncWrite + Unpin>(
 
     let entry_writer = csv.into_inner().await.unwrap();
     entry_writer.close().await.unwrap();
+    tracing::debug!("finished entry");
 }
 
 #[allow(dead_code)]
