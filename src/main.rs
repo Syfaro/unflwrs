@@ -735,6 +735,55 @@ where
     tracing::debug!("starting zip writer");
     let mut wtr = async_zip::write::ZipFileWriter::new(wtr);
 
+    let follower_count = user
+        .public_metrics
+        .as_ref()
+        .map(|metrics| metrics.followers_count)
+        .unwrap_or_default();
+    let mut follower_ids = HashSet::with_capacity(follower_count);
+
+    if follower_count > 15_000 {
+        tracing::warn!("user followers more than 15,000");
+        publish_event(
+            client,
+            channel,
+            ExportEvent::message("skipping followers, greater than 15,000"),
+        )
+        .await;
+    } else {
+        tracing::debug!("loading followers");
+        publish_event(client, channel, ExportEvent::message("loading followers")).await;
+        let mut follower_req = api.get_user_followers(user.id);
+        follower_req
+            .max_results(1000)
+            .expansions([UserExpansion::PinnedTweetId])
+            .user_fields([
+                UserField::Id,
+                UserField::Description,
+                UserField::Entities,
+                UserField::Location,
+                UserField::Name,
+                UserField::Url,
+                UserField::Username,
+                UserField::PinnedTweetId,
+            ])
+            .tweet_fields([TweetField::Entities, TweetField::Text]);
+
+        let (followers, expansions) = fetch_all(|| follower_req.send())
+            .await
+            .map_err(|err| err.to_string())?;
+
+        follower_ids.extend(followers.iter().map(|user| user.id));
+
+        create_user_entry_v2(
+            &mut wtr,
+            "followers.csv".to_string(),
+            followers.iter(),
+            &expansions.tweets.unwrap_or_default(),
+        )
+        .await;
+    }
+
     if user
         .public_metrics
         .as_ref()
@@ -772,57 +821,23 @@ where
             .await
             .map_err(|err| err.to_string())?;
 
+        let pinned_tweets = expansions.tweets.unwrap_or_default();
+
         create_user_entry_v2(
             &mut wtr,
             "following.csv".to_string(),
-            following,
-            expansions.tweets.unwrap_or_default(),
+            following.iter(),
+            &pinned_tweets,
         )
         .await;
-    }
-
-    if user
-        .public_metrics
-        .as_ref()
-        .map(|metrics| metrics.followers_count)
-        .unwrap_or_default()
-        > 15_000
-    {
-        tracing::warn!("user followers more than 15,000");
-        publish_event(
-            client,
-            channel,
-            ExportEvent::message("skipping followers, greater than 15,000"),
-        )
-        .await;
-    } else {
-        tracing::debug!("loading followers");
-        publish_event(client, channel, ExportEvent::message("loading followers")).await;
-        let mut follower_req = api.get_user_followers(user.id);
-        follower_req
-            .max_results(1000)
-            .expansions([UserExpansion::PinnedTweetId])
-            .user_fields([
-                UserField::Id,
-                UserField::Description,
-                UserField::Entities,
-                UserField::Location,
-                UserField::Name,
-                UserField::Url,
-                UserField::Username,
-                UserField::PinnedTweetId,
-            ])
-            .tweet_fields([TweetField::Entities, TweetField::Text]);
-
-        let (followers, expansions) = fetch_all(|| follower_req.send())
-            .await
-            .map_err(|err| err.to_string())?;
 
         create_user_entry_v2(
             &mut wtr,
-            "followers.csv".to_string(),
-            followers,
-            expansions.tweets.unwrap_or_default(),
+            "mutuals.csv".to_string(),
+            following
+                .iter()
+                .filter(|following| follower_ids.contains(&following.id)),
+            &pinned_tweets,
         )
         .await;
     }
@@ -869,8 +884,8 @@ where
         create_user_entry_v2(
             &mut wtr,
             format!("list-{}-{}.csv", list.id, slug::slugify(list.name)),
-            members,
-            expansions.tweets.unwrap_or_default(),
+            members.iter(),
+            &expansions.tweets.unwrap_or_default(),
         )
         .await;
     }
@@ -921,10 +936,10 @@ struct TwitterEntry<'a> {
 async fn create_user_entry_v2<W: tokio::io::AsyncWrite + Unpin>(
     wtr: &mut async_zip::write::ZipFileWriter<W>,
     name: String,
-    users: Vec<twitter_v2::User>,
-    pinned_tweets: Vec<twitter_v2::Tweet>,
+    users: impl Iterator<Item = &twitter_v2::User>,
+    pinned_tweets: &[twitter_v2::Tweet],
 ) {
-    tracing::debug!("starting entry with {} users", users.len());
+    tracing::debug!("starting entry");
     let opts = async_zip::ZipEntryBuilder::new(name, async_zip::Compression::Deflate)
         .unix_permissions(777);
     let entry_writer = wtr.write_entry_stream(opts).await.unwrap();
