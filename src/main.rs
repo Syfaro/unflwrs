@@ -3,15 +3,17 @@ use std::collections::{HashMap, HashSet};
 use actix_session::{storage::CookieSessionStore, Session, SessionMiddleware};
 use actix_web::{get, post, web, App, HttpResponse, HttpServer};
 use askama::Template;
+use async_zip::ZipEntryBuilderExt;
 use bytes::Bytes;
 use clap::Parser;
-use futures::{StreamExt, TryFutureExt, TryStreamExt};
+use futures::{Future, StreamExt, TryFutureExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
+use tracing::Instrument;
 use twitter_v2::{
     authorization::{Oauth2Client, Oauth2Token, Scope},
     id::NumericId,
     oauth2::{AuthorizationCode, CsrfToken, PkceCodeChallenge, PkceCodeVerifier},
-    prelude::{PaginableApiResponse, PaginationMeta},
+    prelude::PaginableApiResponse,
     query::{ListField, TweetField, UserExpansion, UserField},
     TwitterApi,
 };
@@ -468,56 +470,35 @@ async fn twitter_callback_v2(
         .await
         .map_err(actix_web::error::ErrorInternalServerError)?;
 
-    oneoff_v2(&cx.oauth2_client, token).await
+    oneoff_v2(token).await
 }
 
-#[tracing::instrument(skip(client, token))]
-async fn oneoff_v2(
-    client: &Oauth2Client,
-    mut token: Oauth2Token,
-) -> actix_web::Result<actix_web::HttpResponse> {
+#[tracing::instrument(skip(token), fields(user_id))]
+async fn oneoff_v2(token: Oauth2Token) -> actix_web::Result<actix_web::HttpResponse> {
     tracing::info!("starting oneoff v2");
-
-    client
-        .refresh_token_if_expired(&mut token)
-        .await
-        .map_err(actix_web::error::ErrorInternalServerError)?;
     let api = TwitterApi::new(token);
 
-    let user_api = api
-        .with_user_ctx()
+    let user_id = api
+        .get_users_me()
+        .send()
         .await
-        .map_err(actix_web::error::ErrorInternalServerError)?;
+        .map_err(actix_web::error::ErrorInternalServerError)?
+        .into_data()
+        .unwrap()
+        .id;
+    tracing::Span::current().record("user_id", user_id.as_u64());
+    tracing::debug!("found user");
 
-    let mut list_request = user_api.get_my_owned_lists();
+    let mut list_request = api.get_user_owned_lists(user_id);
     list_request
         .max_results(100)
         .list_fields([ListField::MemberCount]);
 
-    let mut resp = list_request
-        .send()
+    let (lists, _expansions) = fetch_all(|| list_request.send())
         .await
         .map_err(actix_web::error::ErrorInternalServerError)?;
 
-    let mut lists = Vec::new();
-    if let Some(new_lists) = resp.data() {
-        lists.extend_from_slice(new_lists);
-    }
-
-    while matches!(resp.meta(), Some(meta) if meta.next_token().is_some()) {
-        resp = resp
-            .next_page()
-            .await
-            .map_err(actix_web::error::ErrorInternalServerError)?
-            .ok_or_else(|| actix_web::error::ErrorInternalServerError("next page did not exist"))?;
-
-        if let Some(new_lists) = resp.data() {
-            lists.extend_from_slice(new_lists);
-        }
-    }
-
     let mut users: HashMap<NumericId, twitter_v2::User> = HashMap::new();
-
     let mut list_members: HashMap<NumericId, (String, Vec<NumericId>)> =
         HashMap::with_capacity(lists.len());
     let mut pinned_tweets: HashMap<NumericId, twitter_v2::Tweet> = HashMap::new();
@@ -541,53 +522,27 @@ async fn oneoff_v2(
             ])
             .tweet_fields([TweetField::Entities, TweetField::Text]);
 
-        let mut resp = member_request
-            .send()
+        let (members, expansions) = fetch_all(|| member_request.send())
             .await
             .map_err(actix_web::error::ErrorInternalServerError)?;
 
-        if let Some(includes) = resp.includes() {
-            if let Some(tweets) = &includes.tweets {
-                pinned_tweets.extend(tweets.iter().map(|tweet| (tweet.id, tweet.clone())));
-            }
+        list_members.insert(
+            list.id,
+            (
+                slug::slugify(list.name),
+                members.iter().map(|user| user.id).collect(),
+            ),
+        );
+        users.extend(members.into_iter().map(|user| (user.id, user)));
+
+        if let Some(tweets) = expansions.tweets {
+            pinned_tweets.extend(tweets.into_iter().map(|tweet| (tweet.id, tweet)));
         }
-
-        let mut members = Vec::with_capacity(list.member_count.unwrap_or_default());
-
-        if let Some(new_members) = resp.data() {
-            members.extend(new_members.iter().map(|member| member.id));
-            users.extend(new_members.iter().map(|member| (member.id, member.clone())));
-        }
-
-        while matches!(resp.meta(), Some(meta) if meta.next_token().is_some()) {
-            resp = resp
-                .next_page()
-                .await
-                .map_err(actix_web::error::ErrorInternalServerError)?
-                .ok_or_else(|| {
-                    actix_web::error::ErrorInternalServerError("next page did not exist")
-                })?;
-
-            if let Some(includes) = resp.includes() {
-                if let Some(tweets) = &includes.tweets {
-                    pinned_tweets.extend(tweets.iter().map(|tweet| (tweet.id, tweet.clone())));
-                }
-            }
-
-            if let Some(new_members) = resp.data() {
-                members.extend(new_members.iter().map(|member| member.id));
-                users.extend(new_members.iter().map(|member| (member.id, member.clone())));
-            }
-        }
-
-        tracing::debug!(list_id = %list.id, "found {} members in list", members.len());
-
-        list_members.insert(list.id, (slug::slugify(list.name), members));
     }
 
-    tracing::trace!("found {} users in lists", users.len());
+    tracing::debug!("found {} users in lists", users.len());
 
-    let mut following_req = user_api.get_my_following();
+    let mut following_req = api.get_user_following(user_id);
     following_req
         .max_results(1000)
         .expansions([UserExpansion::PinnedTweetId])
@@ -603,53 +558,20 @@ async fn oneoff_v2(
         ])
         .tweet_fields([TweetField::Entities, TweetField::Text]);
 
-    let mut resp = following_req
-        .send()
+    let (following, expansions) = fetch_all(|| following_req.send())
         .await
         .map_err(actix_web::error::ErrorInternalServerError)?;
 
-    if let Some(includes) = resp.includes() {
-        if let Some(tweets) = &includes.tweets {
-            pinned_tweets.extend(tweets.iter().map(|tweet| (tweet.id, tweet.clone())));
-        }
-    }
+    let following_ids: Vec<_> = following.iter().map(|user| user.id).collect();
+    users.extend(following.into_iter().map(|user| (user.id, user)));
 
-    let mut following_ids = Vec::new();
-    if let Some(new_following) = resp.data() {
-        following_ids.extend(new_following.iter().map(|following| following.id));
-        users.extend(
-            new_following
-                .iter()
-                .map(|member| (member.id, member.clone())),
-        );
-    }
-
-    while matches!(resp.meta(), Some(meta) if meta.next_token().is_some()) {
-        resp = resp
-            .next_page()
-            .await
-            .map_err(actix_web::error::ErrorInternalServerError)?
-            .ok_or_else(|| actix_web::error::ErrorInternalServerError("next page did not exist"))?;
-
-        if let Some(includes) = resp.includes() {
-            if let Some(tweets) = &includes.tweets {
-                pinned_tweets.extend(tweets.iter().map(|tweet| (tweet.id, tweet.clone())));
-            }
-        }
-
-        if let Some(new_following) = resp.data() {
-            following_ids.extend(new_following.iter().map(|following| following.id));
-            users.extend(
-                new_following
-                    .iter()
-                    .map(|member| (member.id, member.clone())),
-            );
-        }
+    if let Some(tweets) = expansions.tweets {
+        pinned_tweets.extend(tweets.into_iter().map(|tweet| (tweet.id, tweet)));
     }
 
     tracing::debug!("found {} following", following_ids.len());
 
-    let mut follower_req = user_api.get_my_followers();
+    let mut follower_req = api.get_user_followers(user_id);
     follower_req
         .max_results(1000)
         .expansions([UserExpansion::PinnedTweetId])
@@ -665,89 +587,60 @@ async fn oneoff_v2(
         ])
         .tweet_fields([TweetField::Entities, TweetField::Text]);
 
-    let mut resp = follower_req
-        .send()
+    let (followers, expansions) = fetch_all(|| follower_req.send())
         .await
         .map_err(actix_web::error::ErrorInternalServerError)?;
 
-    if let Some(includes) = resp.includes() {
-        if let Some(tweets) = &includes.tweets {
-            pinned_tweets.extend(tweets.iter().map(|tweet| (tweet.id, tweet.clone())));
-        }
-    }
+    let follower_ids: Vec<_> = followers.iter().map(|user| user.id).collect();
+    users.extend(followers.into_iter().map(|user| (user.id, user)));
 
-    let mut follower_ids = Vec::new();
-    if let Some(new_follower) = resp.data() {
-        follower_ids.extend(new_follower.iter().map(|follower| follower.id));
-        users.extend(
-            new_follower
-                .iter()
-                .map(|member| (member.id, member.clone())),
-        );
-    }
-
-    while matches!(resp.meta(), Some(meta) if meta.next_token().is_some()) {
-        resp = resp
-            .next_page()
-            .await
-            .map_err(actix_web::error::ErrorInternalServerError)?
-            .ok_or_else(|| actix_web::error::ErrorInternalServerError("next page did not exist"))?;
-
-        if let Some(includes) = resp.includes() {
-            if let Some(tweets) = &includes.tweets {
-                pinned_tweets.extend(tweets.iter().map(|tweet| (tweet.id, tweet.clone())));
-            }
-        }
-
-        if let Some(new_follower) = resp.data() {
-            follower_ids.extend(new_follower.iter().map(|follower| follower.id));
-            users.extend(
-                new_follower
-                    .iter()
-                    .map(|member| (member.id, member.clone())),
-            );
-        }
+    if let Some(tweets) = expansions.tweets {
+        pinned_tweets.extend(tweets.into_iter().map(|tweet| (tweet.id, tweet)));
     }
 
     tracing::debug!("found {} followers", follower_ids.len());
-
     tracing::debug!("discovered {} pinned tweets", pinned_tweets.len());
 
     let (mut wtr, rdr) = tokio::io::duplex(1024);
 
-    tokio::task::spawn(async move {
-        let mut wtr = async_zip::write::ZipFileWriter::new(&mut wtr);
+    tokio::task::spawn(
+        async move {
+            tracing::debug!("starting zip writer");
+            let mut wtr = async_zip::write::ZipFileWriter::new(&mut wtr);
 
-        create_user_entry_v2(
-            &mut wtr,
-            "followers.csv".to_string(),
-            &users,
-            &pinned_tweets,
-            &follower_ids,
-        )
-        .await;
-        create_user_entry_v2(
-            &mut wtr,
-            "following.csv".to_string(),
-            &users,
-            &pinned_tweets,
-            &following_ids,
-        )
-        .await;
-
-        for (id, (slug, member_ids)) in list_members {
             create_user_entry_v2(
                 &mut wtr,
-                format!("list-{id}-{slug}.csv"),
+                "followers.csv".to_string(),
                 &users,
                 &pinned_tweets,
-                &member_ids,
+                &follower_ids,
             )
             .await;
-        }
+            create_user_entry_v2(
+                &mut wtr,
+                "following.csv".to_string(),
+                &users,
+                &pinned_tweets,
+                &following_ids,
+            )
+            .await;
 
-        wtr.close().await.unwrap();
-    });
+            for (id, (slug, member_ids)) in list_members {
+                create_user_entry_v2(
+                    &mut wtr,
+                    format!("list-{id}-{slug}.csv"),
+                    &users,
+                    &pinned_tweets,
+                    &member_ids,
+                )
+                .await;
+            }
+
+            wtr.close().await.unwrap();
+            tracing::info!("finished writing zip");
+        }
+        .in_current_span(),
+    );
 
     let stream = tokio_util::codec::FramedRead::new(rdr, tokio_util::codec::BytesCodec::new())
         .map_ok(|b| b.freeze());
@@ -759,6 +652,81 @@ async fn oneoff_v2(
         ))
         .content_type("application/zip")
         .streaming(stream))
+}
+
+#[tracing::instrument(skip(f))]
+async fn fetch_all<T, A, M, F, Fut>(
+    f: F,
+) -> twitter_v2::Result<(Vec<T>, twitter_v2::data::Expansions)>
+where
+    T: serde::de::DeserializeOwned + Clone + Send + Sync,
+    A: twitter_v2::Authorization + Send + Sync,
+    M: serde::de::DeserializeOwned + twitter_v2::meta::PaginationMeta + Send + Sync,
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = twitter_v2::Result<twitter_v2::ApiResponse<A, Vec<T>, M>>>,
+{
+    tracing::debug!("fetching first page");
+    let mut resp = f().await?;
+
+    let mut items = Vec::new();
+    let mut expansions = twitter_v2::data::Expansions {
+        users: None,
+        tweets: None,
+        spaces: None,
+        media: None,
+        polls: None,
+        places: None,
+    };
+
+    if let Some(new_items) = resp.data() {
+        items.extend_from_slice(new_items);
+    }
+
+    if let Some(new_expansions) = resp.includes() {
+        merge_expansions(&mut expansions, new_expansions);
+    }
+
+    while let Some(next_page) = resp.next_page().await? {
+        tracing::debug!("fetched next page");
+        resp = next_page;
+
+        if let Some(new_items) = resp.data() {
+            items.extend_from_slice(new_items);
+        }
+
+        if let Some(new_expansions) = resp.includes() {
+            merge_expansions(&mut expansions, new_expansions);
+        }
+    }
+
+    tracing::info!("completed fetch, discovered {} items", items.len());
+    Ok((items, expansions))
+}
+
+macro_rules! merge_expansion_field {
+    ($expansions:expr, $new_expansions:expr, $field:ident) => {
+        if let Some(field) = $new_expansions.$field.as_ref() {
+            let expansion_field = if let Some(existing_field) = $expansions.$field.as_mut() {
+                existing_field
+            } else {
+                $expansions.$field = Some(Vec::with_capacity(field.len()));
+                $expansions.$field.as_mut().unwrap()
+            };
+            expansion_field.extend_from_slice(field);
+        }
+    };
+}
+
+fn merge_expansions(
+    expansions: &mut twitter_v2::data::Expansions,
+    new_expansions: &twitter_v2::data::Expansions,
+) {
+    merge_expansion_field!(expansions, new_expansions, users);
+    merge_expansion_field!(expansions, new_expansions, tweets);
+    merge_expansion_field!(expansions, new_expansions, spaces);
+    merge_expansion_field!(expansions, new_expansions, media);
+    merge_expansion_field!(expansions, new_expansions, polls);
+    merge_expansion_field!(expansions, new_expansions, places);
 }
 
 #[derive(Template)]
@@ -795,7 +763,7 @@ struct TwitterEntry<'a> {
     pinned_tweet: Option<String>,
 }
 
-#[tracing::instrument(skip(wtr, users, ids))]
+#[tracing::instrument(skip(wtr, users, pinned_tweets, ids))]
 async fn create_user_entry_v2<W: tokio::io::AsyncWrite + Unpin>(
     wtr: &mut async_zip::write::ZipFileWriter<W>,
     name: String,
@@ -803,7 +771,8 @@ async fn create_user_entry_v2<W: tokio::io::AsyncWrite + Unpin>(
     pinned_tweets: &HashMap<NumericId, twitter_v2::Tweet>,
     ids: &[NumericId],
 ) {
-    let opts = async_zip::ZipEntryBuilder::new(name, async_zip::Compression::Deflate);
+    let opts = async_zip::ZipEntryBuilder::new(name, async_zip::Compression::Deflate)
+        .unix_permissions(777);
     let entry_writer = wtr.write_entry_stream(opts).await.unwrap();
     let mut csv = csv_async::AsyncSerializer::from_writer(entry_writer);
 
