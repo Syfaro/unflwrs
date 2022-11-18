@@ -4,7 +4,13 @@ use std::{
 };
 
 use actix_session::{storage::CookieSessionStore, Session, SessionMiddleware};
-use actix_web::{get, post, web, App, HttpResponse, HttpServer};
+use actix_web::{
+    dev::{self, ServiceResponse},
+    get,
+    http::{header::ContentType, StatusCode},
+    middleware::{ErrorHandlerResponse, ErrorHandlers},
+    post, web, App, HttpResponse, HttpResponseBuilder, HttpServer,
+};
 use askama::Template;
 use async_zip::ZipEntryBuilderExt;
 use bytes::Bytes;
@@ -123,6 +129,12 @@ async fn main() {
             .service(actix_files::Files::new("/static", "./static"))
             .app_data(web::Data::new(cx))
             .wrap(tracing_actix_web::TracingLogger::default())
+            .wrap(
+                ErrorHandlers::new()
+                    .handler(StatusCode::BAD_REQUEST, error_page)
+                    .handler(StatusCode::INTERNAL_SERVER_ERROR, error_page)
+                    .handler(StatusCode::UNAUTHORIZED, error_page),
+            )
     })
     .bind(("0.0.0.0", 8080))
     .unwrap()
@@ -339,6 +351,30 @@ async fn home(sess: Session) -> Result<actix_web::HttpResponse, AppError> {
     Ok(actix_web::HttpResponse::Ok()
         .content_type("text/html")
         .body(body))
+}
+
+#[derive(Template)]
+#[template(path = "error.html")]
+struct ErrorTemplate {
+    message: Cow<'static, str>,
+}
+
+fn error_page<B>(res: dev::ServiceResponse<B>) -> actix_web::Result<ErrorHandlerResponse<B>> {
+    let status = res.status();
+    let request = res.into_parts().0;
+
+    let body = ErrorTemplate {
+        message: status.to_string().into(),
+    }
+    .render()
+    .unwrap();
+    let new_response = HttpResponseBuilder::new(status)
+        .insert_header(ContentType::html())
+        .body(body);
+
+    Ok(ErrorHandlerResponse::Response(
+        ServiceResponse::new(request, new_response).map_into_right_body(),
+    ))
 }
 
 #[derive(Deserialize)]

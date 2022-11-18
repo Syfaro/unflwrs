@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+
+{% block content %}
+<header class="container">
+    <hgroup>
+        <h1>error</h1>
+        <h2>this shouldn't happen :(</h2>
+    </hgroup>
+</header>
+
+<main class="container">
+    <p>
+        if you're trying to sign in on mobile, make sure you leave the in-app browser after authorization.<br>
+        on ios this can be done by clicking the compass icon in the bottom right.
+    </p>
+
+    <p>for other issues, please send me a message! <a href="https://twitter.com/Syfaro">@syfaro</a></p>
+
+    <p><code>{{ message }}</code></p>
+</main>
+{% endblock %}
