@@ -11,7 +11,15 @@
 <main class="container">
     <form method="POST" action="/twitter/login">
         <div class="login-action">
-            <button name="oneoff" value="yes">friends & followers export</button>
+            <button name="oneoff" value="yes">friends &amp; followers export</button>
+
+            <fieldset>
+                <label for="use_json">
+                    <input type="checkbox" name="use_json" id="use_json">
+                    export json instead of csv (mostly for developers)
+                </label>
+            </fieldset>
+
             <p>
                 generate a zip archive containing csv files of your following, followers, and lists.<br>
                 each user will have an entry with their display name, username, website, location, bio, and pinned tweet.<br>

@@ -12,6 +12,7 @@ use clap::Parser;
 use futures::{Future, StreamExt, TryFutureExt, TryStreamExt};
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncWriteExt;
 use tracing::Instrument;
 use twitter_v2::{
     authorization::{Oauth2Client, Oauth2Token, Scope},
@@ -341,6 +342,7 @@ async fn home(sess: Session) -> Result<actix_web::HttpResponse, AppError> {
 #[derive(Deserialize)]
 struct LoginForm {
     oneoff: Option<String>,
+    use_json: Option<String>,
 }
 
 #[post("/twitter/login")]
@@ -350,6 +352,10 @@ async fn twitter_login(
     form: web::Form<LoginForm>,
 ) -> Result<actix_web::HttpResponse, AppError> {
     let is_oneoff = form.oneoff.as_deref().unwrap_or_default() == "yes";
+
+    if matches!(&form.use_json, Some(val) if val == "on") {
+        sess.insert("use-json", true)?;
+    }
 
     let location = if is_oneoff {
         let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
@@ -513,7 +519,9 @@ async fn export_v2(
         .get("twitter-v2-token")?
         .ok_or_else(|| actix_web::error::ErrorUnauthorized("missing token"))?;
 
-    oneoff_v2(cx.redis.clone(), session_name, token).await
+    let use_json = sess.get("use-json")?.unwrap_or(false);
+
+    oneoff_v2(cx.redis.clone(), session_name, token, use_json).await
 }
 
 #[tracing::instrument(skip(redis, session_name, token), fields(user_id))]
@@ -521,6 +529,7 @@ async fn oneoff_v2(
     mut redis: redis::aio::ConnectionManager,
     session_name: String,
     token: Oauth2Token,
+    use_json: bool,
 ) -> actix_web::Result<actix_web::HttpResponse> {
     let channel = format!("unflwrs:export:{session_name}");
 
@@ -546,7 +555,7 @@ async fn oneoff_v2(
 
     tokio::task::spawn(
         async move {
-            if let Err(err) = write_zips(&mut redis, wtr, api, user, &channel).await {
+            if let Err(err) = write_zips(&mut redis, wtr, api, user, &channel, use_json).await {
                 tracing::error!("could not finish zip: {err}");
                 publish_event(
                     &mut redis,
@@ -727,6 +736,7 @@ async fn write_zips<W, A>(
     api: twitter_v2::TwitterApi<A>,
     user: twitter_v2::User,
     channel: &str,
+    use_json: bool,
 ) -> Result<(), String>
 where
     W: tokio::io::AsyncWrite + Unpin,
@@ -758,14 +768,16 @@ where
             .max_results(1000)
             .expansions([UserExpansion::PinnedTweetId])
             .user_fields([
-                UserField::Id,
+                UserField::CreatedAt,
                 UserField::Description,
                 UserField::Entities,
+                UserField::Id,
                 UserField::Location,
                 UserField::Name,
+                UserField::PinnedTweetId,
+                UserField::Protected,
                 UserField::Url,
                 UserField::Username,
-                UserField::PinnedTweetId,
             ])
             .tweet_fields([TweetField::Entities, TweetField::Text]);
 
@@ -775,13 +787,23 @@ where
 
         follower_ids.extend(followers.iter().map(|user| user.id));
 
-        create_user_entry_v2(
-            &mut wtr,
-            "followers.csv".to_string(),
-            followers.iter(),
-            &expansions.tweets.unwrap_or_default(),
-        )
-        .await;
+        if use_json {
+            create_user_entry_json(
+                &mut wtr,
+                "followers.json".to_string(),
+                followers.iter(),
+                &expansions.tweets.unwrap_or_default(),
+            )
+            .await;
+        } else {
+            create_user_entry_v2(
+                &mut wtr,
+                "followers.csv".to_string(),
+                followers.iter(),
+                &expansions.tweets.unwrap_or_default(),
+            )
+            .await;
+        }
     }
 
     if user
@@ -806,14 +828,16 @@ where
             .max_results(1000)
             .expansions([UserExpansion::PinnedTweetId])
             .user_fields([
-                UserField::Id,
+                UserField::CreatedAt,
                 UserField::Description,
                 UserField::Entities,
+                UserField::Id,
                 UserField::Location,
                 UserField::Name,
+                UserField::PinnedTweetId,
+                UserField::Protected,
                 UserField::Url,
                 UserField::Username,
-                UserField::PinnedTweetId,
             ])
             .tweet_fields([TweetField::Entities, TweetField::Text]);
 
@@ -823,23 +847,33 @@ where
 
         let pinned_tweets = expansions.tweets.unwrap_or_default();
 
-        create_user_entry_v2(
-            &mut wtr,
-            "following.csv".to_string(),
-            following.iter(),
-            &pinned_tweets,
-        )
-        .await;
+        if use_json {
+            create_user_entry_json(
+                &mut wtr,
+                "following.json".to_string(),
+                following.iter(),
+                &pinned_tweets,
+            )
+            .await;
+        } else {
+            create_user_entry_v2(
+                &mut wtr,
+                "following.csv".to_string(),
+                following.iter(),
+                &pinned_tweets,
+            )
+            .await;
 
-        create_user_entry_v2(
-            &mut wtr,
-            "mutuals.csv".to_string(),
-            following
-                .iter()
-                .filter(|following| follower_ids.contains(&following.id)),
-            &pinned_tweets,
-        )
-        .await;
+            create_user_entry_v2(
+                &mut wtr,
+                "mutuals.csv".to_string(),
+                following
+                    .iter()
+                    .filter(|following| follower_ids.contains(&following.id)),
+                &pinned_tweets,
+            )
+            .await;
+        }
     }
 
     tracing::debug!("loading lists");
@@ -866,14 +900,16 @@ where
             .max_results(100)
             .expansions([UserExpansion::PinnedTweetId])
             .user_fields([
-                UserField::Id,
+                UserField::CreatedAt,
                 UserField::Description,
                 UserField::Entities,
+                UserField::Id,
                 UserField::Location,
                 UserField::Name,
+                UserField::PinnedTweetId,
+                UserField::Protected,
                 UserField::Url,
                 UserField::Username,
-                UserField::PinnedTweetId,
             ])
             .tweet_fields([TweetField::Entities, TweetField::Text]);
 
@@ -881,13 +917,23 @@ where
             .await
             .map_err(|err| err.to_string())?;
 
-        create_user_entry_v2(
-            &mut wtr,
-            format!("list-{}-{}.csv", list.id, slug::slugify(list.name)),
-            members.iter(),
-            &expansions.tweets.unwrap_or_default(),
-        )
-        .await;
+        if use_json {
+            create_user_entry_json(
+                &mut wtr,
+                format!("list-{}-{}.json", list.id, slug::slugify(list.name)),
+                members.iter(),
+                &expansions.tweets.unwrap_or_default(),
+            )
+            .await;
+        } else {
+            create_user_entry_v2(
+                &mut wtr,
+                format!("list-{}-{}.csv", list.id, slug::slugify(list.name)),
+                members.iter(),
+                &expansions.tweets.unwrap_or_default(),
+            )
+            .await;
+        }
     }
 
     wtr.close().await.unwrap();
@@ -930,6 +976,36 @@ struct TwitterEntry<'a> {
     location: Option<&'a str>,
     bio: Option<String>,
     pinned_tweet: Option<String>,
+}
+
+async fn create_user_entry_json<W: tokio::io::AsyncWrite + Unpin>(
+    wtr: &mut async_zip::write::ZipFileWriter<W>,
+    name: String,
+    users: impl Iterator<Item = &twitter_v2::User>,
+    pinned_tweets: &[twitter_v2::Tweet],
+) {
+    let opts = async_zip::ZipEntryBuilder::new(name, async_zip::Compression::Deflate)
+        .unix_permissions(777);
+    let mut entry_writer = wtr.write_entry_stream(opts).await.unwrap();
+
+    let pinned_tweets: HashMap<_, _> = pinned_tweets
+        .into_iter()
+        .map(|tweet| (tweet.id, tweet))
+        .collect();
+
+    let users: Vec<_> = users
+        .map(|user| {
+            (
+                user,
+                user.pinned_tweet_id.and_then(|id| pinned_tweets.get(&id)),
+            )
+        })
+        .collect();
+
+    let data = serde_json::to_vec(&users).unwrap();
+
+    entry_writer.write_all(&data).await.unwrap();
+    entry_writer.close().await.unwrap();
 }
 
 #[tracing::instrument(skip(wtr, users, pinned_tweets))]
