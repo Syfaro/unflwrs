@@ -113,9 +113,10 @@ if (document.querySelector('main[data-page="export"]')) {
         eventText = data['data']['text'];
         break;
       case 'error':
+        eventText = data['data']['message'];
         alert(`error! ${data['data']['message']}`);
         endExport(sse, startButton);
-        return;
+        break;
       case 'completed':
         eventText = 'completed';
         endExport(sse, startButton);
