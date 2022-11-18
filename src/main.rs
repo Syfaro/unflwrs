@@ -333,6 +333,8 @@ async fn home(sess: Session) -> Result<actix_web::HttpResponse, AppError> {
             .finish());
     }
 
+    sess.clear();
+
     let body = HomeTemplate.render()?;
     Ok(actix_web::HttpResponse::Ok()
         .content_type("text/html")
@@ -971,7 +973,8 @@ async fn signout(sess: Session) -> Result<actix_web::HttpResponse, actix_web::Er
 #[derive(Default, Serialize)]
 struct TwitterEntry<'a> {
     id: u64,
-    screen_name: Option<&'a str>,
+    username: Option<&'a str>,
+    name: Option<&'a str>,
     website: Option<String>,
     location: Option<&'a str>,
     bio: Option<String>,
@@ -1098,7 +1101,8 @@ async fn create_user_entry_v2<W: tokio::io::AsyncWrite + Unpin>(
 
         let row = TwitterEntry {
             id: user.id.as_u64(),
-            screen_name: Some(&user.username),
+            username: Some(&user.username),
+            name: Some(&user.name),
             website: url,
             location: user.location.as_deref(),
             bio,
