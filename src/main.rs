@@ -835,13 +835,15 @@ where
             )
             .await;
         } else {
-            create_user_entry_v2(
-                &mut wtr,
-                "followers.csv".to_string(),
-                followers.iter(),
-                &expansions.tweets.unwrap_or_default(),
-            )
-            .await;
+            if followers.len() > 0 {
+                create_user_entry_v2(
+                    &mut wtr,
+                    "followers.csv".to_string(),
+                    followers.iter(),
+                    &expansions.tweets.unwrap_or_default(),
+                )
+                .await;
+            }
         }
     }
 
@@ -895,23 +897,29 @@ where
             )
             .await;
         } else {
-            create_user_entry_v2(
-                &mut wtr,
-                "following.csv".to_string(),
-                following.iter(),
-                &pinned_tweets,
-            )
-            .await;
+            if following.len() > 0 {
+                create_user_entry_v2(
+                    &mut wtr,
+                    "following.csv".to_string(),
+                    following.iter(),
+                    &pinned_tweets,
+                )
+                .await;
 
-            create_user_entry_v2(
-                &mut wtr,
-                "mutuals.csv".to_string(),
-                following
-                    .iter()
-                    .filter(|following| follower_ids.contains(&following.id)),
-                &pinned_tweets,
-            )
-            .await;
+                if follower_ids.len() > 0
+                    && following.iter().any(|user| follower_ids.contains(&user.id))
+                {
+                    create_user_entry_v2(
+                        &mut wtr,
+                        "mutuals.csv".to_string(),
+                        following
+                            .iter()
+                            .filter(|following| follower_ids.contains(&following.id)),
+                        &pinned_tweets,
+                    )
+                    .await;
+                }
+            }
         }
     }
 
@@ -965,13 +973,15 @@ where
             )
             .await;
         } else {
-            create_user_entry_v2(
-                &mut wtr,
-                format!("list-{}-{}.csv", list.id, slug::slugify(list.name)),
-                members.iter(),
-                &expansions.tweets.unwrap_or_default(),
-            )
-            .await;
+            if members.len() > 0 {
+                create_user_entry_v2(
+                    &mut wtr,
+                    format!("list-{}-{}.csv", list.id, slug::slugify(list.name)),
+                    members.iter(),
+                    &expansions.tweets.unwrap_or_default(),
+                )
+                .await;
+            }
         }
     }
 
