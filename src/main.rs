@@ -131,6 +131,7 @@ async fn main() {
             .wrap(tracing_actix_web::TracingLogger::default())
             .wrap(
                 ErrorHandlers::new()
+                    .handler(StatusCode::NOT_FOUND, error_page)
                     .handler(StatusCode::BAD_REQUEST, error_page)
                     .handler(StatusCode::INTERNAL_SERVER_ERROR, error_page)
                     .handler(StatusCode::UNAUTHORIZED, error_page),
