@@ -1,10 +1,14 @@
-@media (prefers-color-scheme: dark) {
-  .ct-chart .ct-label {
-    color: white;
-  }
-}
-
 .delete[role="button"] {
   color: var(--del-color);
   border-color: var(--del-color);
+}
+
+.login-action:not(:first-child) {
+  margin-top: 5em;
+}
+
+@media (max-width: 999px) {
+  .login-action br {
+    display: contents;
+  }
 }

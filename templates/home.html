@@ -10,12 +10,22 @@
 
 <main class="container">
     <form method="POST" action="/twitter/login">
-        <button>sign in with twitter</button>
+        <div class="login-action">
+            <button name="oneoff" value="yes">friends & followers export</button>
+            <p>
+                generate a zip archive containing csv files of your following, followers, and lists.<br>
+                each user will have an entry with their display name, username, website, location, bio, and pinned tweet.<br>
+                no information is retained on the server.
+            </p>
+        </div>
 
-        <label for="oneoff">
-            <input type="checkbox" id="oneoff" name="oneoff" value="yes">
-            perform a one-off export of friends and followers instead
-        </label>
+        <div class="login-action">
+            <button class="outline">track my followers</button>
+            <p>
+                keep checking your twitter followers to keep track of them over time.<br>
+                twitter tokens will be saved to fetch this information.
+            </p>
+        </div>
     </form>
 </main>
 {% endblock %}
