@@ -1051,12 +1051,13 @@ where
         }
     }
 
-    let req = reqwest::ClientBuilder::default()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .unwrap();
-
     if opts.bookmarks {
+        // Videos can take a long time to download, set a higher timeout
+        let req = reqwest::ClientBuilder::default()
+            .timeout(std::time::Duration::from_secs(60 * 5))
+            .build()
+            .unwrap();
+
         let mut bookmarks_request = api.get_user_bookmarks(user.id);
         bookmarks_request
             .max_results(100)
@@ -1173,7 +1174,7 @@ where
 
                 if let Some((url, filename)) = media_info {
                     if let Err(err) = save_media(&mut wtr, &req, filename, url.as_str()).await {
-                        tracing::warn!("could not download media: {err}");
+                        tracing::warn!(media_id = %media.media_key, %tweet_id, "could not download media: {err}");
                         publish_event(
                             client,
                             channel,
@@ -1185,6 +1186,11 @@ where
             }
         }
     }
+
+    let req = reqwest::ClientBuilder::default()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
 
     for (username, url) in pictures {
         tracing::trace!(username, "downloading profile picture");
