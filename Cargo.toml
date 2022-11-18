@@ -36,4 +36,4 @@ tokio-util = { version = "0.7.4", features = ["io", "io-util"] }
 tracing = "0.1.37"
 tracing-actix-web = "0.6.2"
 tracing-subscriber = "0.3.16"
-twitter-v2 = { git = "https://github.com/Syfaro/twitter-v2-rs.git", branch = "fix-url-entity", default-features = false, features = ["rustls-tls"] }
+twitter-v2 = { git = "https://github.com/Syfaro/twitter-v2-rs.git", branch = "allow-empty-url", default-features = false, features = ["rustls-tls"] }

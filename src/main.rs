@@ -814,6 +814,7 @@ where
                 UserField::Location,
                 UserField::Name,
                 UserField::PinnedTweetId,
+                UserField::ProfileImageUrl,
                 UserField::Protected,
                 UserField::Url,
                 UserField::Username,
@@ -834,16 +835,14 @@ where
                 &expansions.tweets.unwrap_or_default(),
             )
             .await;
-        } else {
-            if followers.len() > 0 {
-                create_user_entry_v2(
-                    &mut wtr,
-                    "followers.csv".to_string(),
-                    followers.iter(),
-                    &expansions.tweets.unwrap_or_default(),
-                )
-                .await;
-            }
+        } else if !followers.is_empty() {
+            create_user_entry_v2(
+                &mut wtr,
+                "followers.csv".to_string(),
+                followers.iter(),
+                &expansions.tweets.unwrap_or_default(),
+            )
+            .await;
         }
     }
 
@@ -876,6 +875,7 @@ where
                 UserField::Location,
                 UserField::Name,
                 UserField::PinnedTweetId,
+                UserField::ProfileImageUrl,
                 UserField::Protected,
                 UserField::Url,
                 UserField::Username,
@@ -896,29 +896,27 @@ where
                 &pinned_tweets,
             )
             .await;
-        } else {
-            if following.len() > 0 {
+        } else if !following.is_empty() {
+            create_user_entry_v2(
+                &mut wtr,
+                "following.csv".to_string(),
+                following.iter(),
+                &pinned_tweets,
+            )
+            .await;
+
+            if !follower_ids.is_empty()
+                && following.iter().any(|user| follower_ids.contains(&user.id))
+            {
                 create_user_entry_v2(
                     &mut wtr,
-                    "following.csv".to_string(),
-                    following.iter(),
+                    "mutuals.csv".to_string(),
+                    following
+                        .iter()
+                        .filter(|following| follower_ids.contains(&following.id)),
                     &pinned_tweets,
                 )
                 .await;
-
-                if follower_ids.len() > 0
-                    && following.iter().any(|user| follower_ids.contains(&user.id))
-                {
-                    create_user_entry_v2(
-                        &mut wtr,
-                        "mutuals.csv".to_string(),
-                        following
-                            .iter()
-                            .filter(|following| follower_ids.contains(&following.id)),
-                        &pinned_tweets,
-                    )
-                    .await;
-                }
             }
         }
     }
@@ -954,6 +952,7 @@ where
                 UserField::Location,
                 UserField::Name,
                 UserField::PinnedTweetId,
+                UserField::ProfileImageUrl,
                 UserField::Protected,
                 UserField::Url,
                 UserField::Username,
@@ -972,16 +971,14 @@ where
                 &expansions.tweets.unwrap_or_default(),
             )
             .await;
-        } else {
-            if members.len() > 0 {
-                create_user_entry_v2(
-                    &mut wtr,
-                    format!("list-{}-{}.csv", list.id, slug::slugify(list.name)),
-                    members.iter(),
-                    &expansions.tweets.unwrap_or_default(),
-                )
-                .await;
-            }
+        } else if !members.is_empty() {
+            create_user_entry_v2(
+                &mut wtr,
+                format!("list-{}-{}.csv", list.id, slug::slugify(list.name)),
+                members.iter(),
+                &expansions.tweets.unwrap_or_default(),
+            )
+            .await;
         }
     }
 
@@ -1026,6 +1023,7 @@ struct TwitterEntry<'a> {
     location: Option<&'a str>,
     bio: Option<String>,
     pinned_tweet: Option<String>,
+    profile_picture_url: Option<&'a str>,
 }
 
 async fn create_user_entry_json<W: tokio::io::AsyncWrite + Unpin>(
@@ -1039,7 +1037,7 @@ async fn create_user_entry_json<W: tokio::io::AsyncWrite + Unpin>(
     let mut entry_writer = wtr.write_entry_stream(opts).await.unwrap();
 
     let pinned_tweets: HashMap<_, _> = pinned_tweets
-        .into_iter()
+        .iter()
         .map(|tweet| (tweet.id, tweet))
         .collect();
 
@@ -1072,7 +1070,7 @@ async fn create_user_entry_v2<W: tokio::io::AsyncWrite + Unpin>(
     let mut csv = csv_async::AsyncSerializer::from_writer(entry_writer);
 
     let pinned_tweets: HashMap<_, _> = pinned_tweets
-        .into_iter()
+        .iter()
         .map(|tweet| (tweet.id, tweet))
         .collect();
 
@@ -1154,6 +1152,7 @@ async fn create_user_entry_v2<W: tokio::io::AsyncWrite + Unpin>(
             location: user.location.as_deref(),
             bio,
             pinned_tweet,
+            profile_picture_url: user.profile_image_url.as_ref().map(|url| url.as_str()),
         };
 
         csv.serialize(row).await.unwrap();
