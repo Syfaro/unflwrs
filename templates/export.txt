@@ -1,0 +1,11 @@
+hi {{ username.to_lowercase() }},
+
+this is your export of following, followers, and lists.
+
+assuming twitter hasn't fallen apart yet, you can fetch a new export here: https://unflwrs.syfaro.com
+
+if you opted to get profile pictures, they're in a folder named profile_picture/username.jpg
+
+media related to bookmarks is in media/tweetid_fileid.jpg
+
+💜 @syfaro

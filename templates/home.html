@@ -14,6 +14,11 @@
             <button name="oneoff" value="yes">friends &amp; followers export</button>
 
             <fieldset>
+                <label for="export_bookmarks">
+                    <input type="checkbox" name="export_bookmarks" id="export_bookmarks">
+                    export recent bookmarks, including media (experimental, slow)
+                </label>
+
                 <label for="download_profile_pictures">
                     <input type="checkbox" name="download_profile_pictures" id="download_profile_pictures">
                     download profile pictures (very slow)
@@ -64,6 +69,14 @@
             <p>
                 due to limitations in the twitter api, it will only include your following or followers if you have fewer than 15,000.
                 up to 45,000 users can be included in your lists.
+            </p>
+        </details>
+
+        <details>
+            <summary>what does recent bookmarks mean?</summary>
+
+            <p>
+                twitter only allows fetching the 800 most recent bookmarks.
             </p>
         </details>
 

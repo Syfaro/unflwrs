@@ -25,7 +25,7 @@ use twitter_v2::{
     authorization::{Oauth2Client, Oauth2Token, Scope},
     oauth2::{AuthorizationCode, CsrfToken, PkceCodeChallenge, PkceCodeVerifier},
     prelude::PaginableApiResponse,
-    query::{ListField, TweetField, UserExpansion, UserField},
+    query::{ListField, MediaField, TweetExpansion, TweetField, UserExpansion, UserField},
     TwitterApi,
 };
 
@@ -383,12 +383,14 @@ fn error_page<B>(res: dev::ServiceResponse<B>) -> actix_web::Result<ErrorHandler
 struct LoginForm {
     oneoff: Option<String>,
     use_json: Option<String>,
+    export_bookmarks: Option<String>,
     download_profile_pictures: Option<String>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
 struct ExportOptions {
     json: bool,
+    bookmarks: bool,
     profile_pictures: bool,
 }
 
@@ -400,25 +402,28 @@ async fn twitter_login(
 ) -> Result<actix_web::HttpResponse, AppError> {
     let is_oneoff = form.oneoff.as_deref().unwrap_or_default() == "yes";
 
-    sess.insert(
-        "export-options",
-        ExportOptions {
-            json: matches!(&form.use_json, Some(val) if val == "on"),
-            profile_pictures: matches!(&form.download_profile_pictures, Some(val) if val == "on"),
-        },
-    )?;
-
     let location = if is_oneoff {
+        let opts = ExportOptions {
+            json: matches!(&form.use_json, Some(val) if val == "on"),
+            bookmarks: matches!(&form.export_bookmarks, Some(val) if val == "on"),
+            profile_pictures: matches!(&form.download_profile_pictures, Some(val) if val == "on"),
+        };
+
+        let mut scopes = vec![
+            Scope::TweetRead,
+            Scope::UsersRead,
+            Scope::FollowsRead,
+            Scope::ListRead,
+        ];
+
+        if opts.bookmarks {
+            scopes.push(Scope::BookmarkRead);
+        }
+
+        sess.insert("export-options", opts)?;
+
         let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
-        let (url, state) = cx.oauth2_client.auth_url(
-            challenge,
-            [
-                Scope::TweetRead,
-                Scope::UsersRead,
-                Scope::FollowsRead,
-                Scope::ListRead,
-            ],
-        );
+        let (url, state) = cx.oauth2_client.auth_url(challenge, scopes);
 
         sess.insert("twitter-verifier", verifier)?;
         sess.insert("twitter-state", state)?;
@@ -699,6 +704,7 @@ async fn export_events(
 
 #[tracing::instrument(skip(f))]
 async fn fetch_all<T, A, M, F, Fut>(
+    max_requests: usize,
     f: F,
 ) -> twitter_v2::Result<(Vec<T>, twitter_v2::data::Expansions)>
 where
@@ -710,6 +716,7 @@ where
 {
     tracing::debug!("fetching first page");
     let mut resp = f().await?;
+    let mut made_requests = 1;
 
     let mut items = Vec::new();
     let mut expansions = twitter_v2::data::Expansions {
@@ -732,6 +739,7 @@ where
     while let Some(next_page) = resp.next_page().await? {
         tracing::debug!("fetched next page");
         resp = next_page;
+        made_requests += 1;
 
         if let Some(new_items) = resp.data() {
             items.extend_from_slice(new_items);
@@ -739,6 +747,11 @@ where
 
         if let Some(new_expansions) = resp.includes() {
             merge_expansions(&mut expansions, new_expansions);
+        }
+
+        if made_requests >= max_requests {
+            tracing::warn!(made_requests, max_requests, "hit max requests");
+            break;
         }
     }
 
@@ -781,6 +794,12 @@ async fn publish_event(
     let _ = redis.publish::<_, _, ()>(channel, event).await;
 }
 
+#[derive(Template)]
+#[template(path = "export.txt")]
+struct ExportReadmeTemplate<'a> {
+    username: &'a str,
+}
+
 async fn write_zips<W, A>(
     client: &mut redis::aio::ConnectionManager,
     wtr: W,
@@ -795,6 +814,18 @@ where
 {
     tracing::debug!("starting zip writer");
     let mut wtr = async_zip::write::ZipFileWriter::new(wtr);
+
+    let readme = ExportReadmeTemplate {
+        username: &user.username,
+    }
+    .render()
+    .unwrap();
+    let entry =
+        async_zip::ZipEntryBuilder::new("readme.txt".to_string(), async_zip::Compression::Deflate)
+            .unix_permissions(777);
+    let mut entry_writer = wtr.write_entry_stream(entry).await.unwrap();
+    entry_writer.write_all(readme.as_bytes()).await.unwrap();
+    entry_writer.close().await.unwrap();
 
     let following_count = user
         .public_metrics
@@ -841,7 +872,7 @@ where
             ])
             .tweet_fields([TweetField::Entities, TweetField::Text]);
 
-        let (followers, expansions) = fetch_all(|| follower_req.send())
+        let (followers, expansions) = fetch_all(15, || follower_req.send())
             .await
             .map_err(|err| err.to_string())?;
 
@@ -904,7 +935,7 @@ where
             ])
             .tweet_fields([TweetField::Entities, TweetField::Text]);
 
-        let (following, expansions) = fetch_all(|| following_req.send())
+        let (following, expansions) = fetch_all(15, || following_req.send())
             .await
             .map_err(|err| err.to_string())?;
 
@@ -957,7 +988,7 @@ where
         .max_results(100)
         .list_fields([ListField::MemberCount]);
 
-    let (lists, _expansions) = fetch_all(|| list_request.send())
+    let (lists, _expansions) = fetch_all(15, || list_request.send())
         .await
         .map_err(|err| err.to_string())?;
 
@@ -989,7 +1020,7 @@ where
             ])
             .tweet_fields([TweetField::Entities, TweetField::Text]);
 
-        let (members, expansions) = fetch_all(|| member_request.send())
+        let (members, expansions) = fetch_all(900, || member_request.send())
             .await
             .map_err(|err| err.to_string())?;
 
@@ -1025,6 +1056,136 @@ where
         .build()
         .unwrap();
 
+    if opts.bookmarks {
+        let mut bookmarks_request = api.get_user_bookmarks(user.id);
+        bookmarks_request
+            .max_results(100)
+            .expansions([
+                TweetExpansion::AttachmentsMediaKeys,
+                TweetExpansion::AuthorId,
+            ])
+            .media_fields([MediaField::MediaKey, MediaField::Url, MediaField::Variants])
+            .tweet_fields([
+                TweetField::Attachments,
+                TweetField::AuthorId,
+                TweetField::Entities,
+                TweetField::Text,
+            ])
+            .user_fields([UserField::Id, UserField::Name, UserField::Username]);
+
+        publish_event(client, channel, ExportEvent::message("loading bookmarks")).await;
+
+        let (bookmarks, expansions) = fetch_all(180, || bookmarks_request.send()).await.unwrap();
+        let expanded_users = expansions.users.unwrap_or_default();
+
+        let opts = async_zip::ZipEntryBuilder::new(
+            "bookmarks.csv".to_string(),
+            async_zip::Compression::Deflate,
+        )
+        .unix_permissions(777);
+        let entry_writer = wtr.write_entry_stream(opts).await.unwrap();
+        let mut csv = csv_async::AsyncSerializer::from_writer(entry_writer);
+
+        let mut used_media: HashMap<_, Vec<_>> = HashMap::new();
+
+        for bookmark in bookmarks {
+            let media_names = if let Some(twitter_v2::data::Attachments {
+                media_keys: Some(media_keys),
+                ..
+            }) = bookmark.attachments
+            {
+                let ids = media_keys
+                    .iter()
+                    .map(|key| format!("media/{}_{}", bookmark.id, key))
+                    .collect();
+
+                for media_key in media_keys {
+                    used_media.entry(media_key).or_default().push(bookmark.id);
+                }
+
+                ids
+            } else {
+                vec![]
+            };
+
+            let text = if let Some(url_entities) = bookmark
+                .entities
+                .as_ref()
+                .and_then(|entities| entities.urls.as_ref())
+            {
+                url_entities.iter().fold(bookmark.text, |text, entity| {
+                    if let Some(expanded_url) = entity.expanded_url.as_deref() {
+                        text.replace(&entity.url, expanded_url)
+                    } else {
+                        text
+                    }
+                })
+            } else {
+                bookmark.text
+            };
+
+            let author = bookmark
+                .author_id
+                .and_then(|author_id| expanded_users.iter().find(|user| user.id == author_id));
+
+            csv.serialize(BookmarkEntry {
+                id: bookmark.id.as_u64(),
+                author_username: author.map(|author| author.username.as_ref()),
+                author_name: author.map(|author| author.name.as_ref()),
+                text,
+                media: media_names.join(" "),
+            })
+            .await
+            .unwrap();
+        }
+
+        let entry_writer = csv.into_inner().await.unwrap();
+        entry_writer.close().await.unwrap();
+
+        for media in expansions.media.unwrap_or_default() {
+            for tweet_id in used_media.remove(&media.media_key).unwrap_or_default() {
+                tracing::trace!(media_id = %media.media_key, %tweet_id, "downloading media");
+
+                publish_event(
+                    client,
+                    channel,
+                    ExportEvent::message(format!("downloading media for bookmark {tweet_id}")),
+                )
+                .await;
+
+                let media_info = if let Some(variants) = media.variants.as_ref() {
+                    let best_url = variants
+                        .iter()
+                        .filter(|variant| variant.url.is_some())
+                        .max_by(|a, b| {
+                            a.bit_rate
+                                .unwrap_or_default()
+                                .cmp(&b.bit_rate.unwrap_or_default())
+                        })
+                        .and_then(|variant| variant.url.as_ref());
+
+                    best_url.map(|url| (url, format!("media/{}_{}.mp4", tweet_id, media.media_key)))
+                } else if let Some(url) = media.url.as_ref() {
+                    Some((url, format!("media/{}_{}.jpg", tweet_id, media.media_key)))
+                } else {
+                    None
+                };
+
+                if let Some((url, filename)) = media_info {
+                    if let Err(err) = save_media(&mut wtr, &req, filename, url.as_str()).await {
+                        tracing::warn!("could not download media: {err}");
+                        publish_event(
+                            client,
+                            channel,
+                            ExportEvent::message(format!("error downloading media: {tweet_id}")),
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+    }
+
     for (username, url) in pictures {
         tracing::trace!(username, "downloading profile picture");
         publish_event(
@@ -1034,7 +1195,14 @@ where
         )
         .await;
 
-        if let Err(err) = get_profile_picture(&mut wtr, &req, &username, &url).await {
+        if let Err(err) = save_media(
+            &mut wtr,
+            &req,
+            format!("profile_picture/{username}.jpg"),
+            &url,
+        )
+        .await
+        {
             tracing::warn!(username, "could not download profile picture: {err}");
             publish_event(
                 client,
@@ -1053,17 +1221,23 @@ where
     Ok(())
 }
 
-async fn get_profile_picture<W: tokio::io::AsyncWrite + Unpin>(
+#[derive(Serialize)]
+struct BookmarkEntry<'a> {
+    id: u64,
+    author_username: Option<&'a str>,
+    author_name: Option<&'a str>,
+    text: String,
+    media: String,
+}
+
+async fn save_media<W: tokio::io::AsyncWrite + Unpin, S: ToString>(
     wtr: &mut async_zip::write::ZipFileWriter<W>,
     client: &reqwest::Client,
-    username: &str,
+    path: S,
     url: &str,
 ) -> Result<(), eyre::Report> {
-    let opts = async_zip::ZipEntryBuilder::new(
-        format!("profile_picture/{username}.jpg"),
-        async_zip::Compression::Deflate,
-    )
-    .unix_permissions(777);
+    let opts = async_zip::ZipEntryBuilder::new(path.to_string(), async_zip::Compression::Deflate)
+        .unix_permissions(777);
     let mut entry_writer = wtr.write_entry_stream(opts).await?;
 
     let body = client.get(url).send().await?;
