@@ -19,6 +19,7 @@ use futures::{Future, StreamExt, TryFutureExt, TryStreamExt};
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
+use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tracing::Instrument;
 use twitter_v2::{
     authorization::{Oauth2Client, Oauth2Token, Scope},
@@ -382,6 +383,13 @@ fn error_page<B>(res: dev::ServiceResponse<B>) -> actix_web::Result<ErrorHandler
 struct LoginForm {
     oneoff: Option<String>,
     use_json: Option<String>,
+    download_profile_pictures: Option<String>,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct ExportOptions {
+    json: bool,
+    profile_pictures: bool,
 }
 
 #[post("/twitter/login")]
@@ -392,9 +400,13 @@ async fn twitter_login(
 ) -> Result<actix_web::HttpResponse, AppError> {
     let is_oneoff = form.oneoff.as_deref().unwrap_or_default() == "yes";
 
-    if matches!(&form.use_json, Some(val) if val == "on") {
-        sess.insert("use-json", true)?;
-    }
+    sess.insert(
+        "export-options",
+        ExportOptions {
+            json: matches!(&form.use_json, Some(val) if val == "on"),
+            profile_pictures: matches!(&form.download_profile_pictures, Some(val) if val == "on"),
+        },
+    )?;
 
     let location = if is_oneoff {
         let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
@@ -558,17 +570,17 @@ async fn export_v2(
         .get("twitter-v2-token")?
         .ok_or_else(|| actix_web::error::ErrorUnauthorized("missing token"))?;
 
-    let use_json = sess.get("use-json")?.unwrap_or(false);
+    let opts = sess.get("export-options")?.unwrap_or_default();
 
-    oneoff_v2(cx.redis.clone(), session_name, token, use_json).await
+    oneoff_v2(cx.redis.clone(), session_name, token, opts).await
 }
 
-#[tracing::instrument(skip(redis, session_name, token), fields(user_id))]
+#[tracing::instrument(skip(redis, session_name, token, opts), fields(user_id))]
 async fn oneoff_v2(
     mut redis: redis::aio::ConnectionManager,
     session_name: String,
     token: Oauth2Token,
-    use_json: bool,
+    opts: ExportOptions,
 ) -> actix_web::Result<actix_web::HttpResponse> {
     let channel = format!("unflwrs:export:{session_name}");
 
@@ -594,7 +606,7 @@ async fn oneoff_v2(
 
     tokio::task::spawn(
         async move {
-            if let Err(err) = write_zips(&mut redis, wtr, api, user, &channel, use_json).await {
+            if let Err(err) = write_zips(&mut redis, wtr, api, user, &channel, opts).await {
                 tracing::error!("could not finish zip: {err}");
                 publish_event(
                     &mut redis,
@@ -775,7 +787,7 @@ async fn write_zips<W, A>(
     api: twitter_v2::TwitterApi<A>,
     user: twitter_v2::User,
     channel: &str,
-    use_json: bool,
+    opts: ExportOptions,
 ) -> Result<(), String>
 where
     W: tokio::io::AsyncWrite + Unpin,
@@ -784,12 +796,20 @@ where
     tracing::debug!("starting zip writer");
     let mut wtr = async_zip::write::ZipFileWriter::new(wtr);
 
+    let following_count = user
+        .public_metrics
+        .as_ref()
+        .map(|metrics| metrics.following_count)
+        .unwrap_or_default();
     let follower_count = user
         .public_metrics
         .as_ref()
         .map(|metrics| metrics.followers_count)
         .unwrap_or_default();
+
     let mut follower_ids = HashSet::with_capacity(follower_count);
+
+    let mut pictures = HashMap::new();
 
     if follower_count > 15_000 {
         tracing::warn!("user followers more than 15,000");
@@ -827,7 +847,15 @@ where
 
         follower_ids.extend(followers.iter().map(|user| user.id));
 
-        if use_json {
+        if opts.profile_pictures {
+            pictures.extend(followers.iter().flat_map(|user| {
+                user.profile_image_url
+                    .as_ref()
+                    .map(|url| (user.username.clone(), url.as_str().to_owned()))
+            }));
+        }
+
+        if opts.json {
             create_user_entry_json(
                 &mut wtr,
                 "followers.json".to_string(),
@@ -846,13 +874,7 @@ where
         }
     }
 
-    if user
-        .public_metrics
-        .as_ref()
-        .map(|metrics| metrics.following_count)
-        .unwrap_or_default()
-        > 15_000
-    {
+    if following_count > 15_000 {
         tracing::warn!("user following more than 15,000");
         publish_event(
             client,
@@ -888,7 +910,15 @@ where
 
         let pinned_tweets = expansions.tweets.unwrap_or_default();
 
-        if use_json {
+        if opts.profile_pictures {
+            pictures.extend(following.iter().flat_map(|user| {
+                user.profile_image_url
+                    .as_ref()
+                    .map(|url| (user.username.clone(), url.as_str().to_owned()))
+            }));
+        }
+
+        if opts.json {
             create_user_entry_json(
                 &mut wtr,
                 "following.json".to_string(),
@@ -963,7 +993,15 @@ where
             .await
             .map_err(|err| err.to_string())?;
 
-        if use_json {
+        if opts.profile_pictures {
+            pictures.extend(members.iter().flat_map(|user| {
+                user.profile_image_url
+                    .as_ref()
+                    .map(|url| (user.username.clone(), url.as_str().to_owned()))
+            }));
+        }
+
+        if opts.json {
             create_user_entry_json(
                 &mut wtr,
                 format!("list-{}-{}.json", list.id, slug::slugify(list.name)),
@@ -982,10 +1020,61 @@ where
         }
     }
 
+    let req = reqwest::ClientBuilder::default()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    for (username, url) in pictures {
+        tracing::trace!(username, "downloading profile picture");
+        publish_event(
+            client,
+            channel,
+            ExportEvent::message(format!("profile picture: {username}")),
+        )
+        .await;
+
+        if let Err(err) = get_profile_picture(&mut wtr, &req, &username, &url).await {
+            tracing::warn!(username, "could not download profile picture: {err}");
+            publish_event(
+                client,
+                channel,
+                ExportEvent::message(format!("error downloading profile picture: {username}")),
+            )
+            .await;
+        }
+    }
+
     wtr.close().await.unwrap();
     tracing::info!("finished writing zip");
 
     publish_event(client, channel, ExportEvent::Completed).await;
+
+    Ok(())
+}
+
+async fn get_profile_picture<W: tokio::io::AsyncWrite + Unpin>(
+    wtr: &mut async_zip::write::ZipFileWriter<W>,
+    client: &reqwest::Client,
+    username: &str,
+    url: &str,
+) -> Result<(), eyre::Report> {
+    let opts = async_zip::ZipEntryBuilder::new(
+        format!("profile_picture/{username}.jpg"),
+        async_zip::Compression::Deflate,
+    )
+    .unix_permissions(777);
+    let mut entry_writer = wtr.write_entry_stream(opts).await?;
+
+    let body = client.get(url).send().await?;
+    let mut stream = body
+        .bytes_stream()
+        .map_err(|e| futures::io::Error::new(futures::io::ErrorKind::Other, e))
+        .into_async_read()
+        .compat();
+    tokio::io::copy(&mut stream, &mut entry_writer).await?;
+
+    entry_writer.close().await?;
 
     Ok(())
 }
