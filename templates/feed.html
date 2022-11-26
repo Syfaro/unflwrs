@@ -7,7 +7,7 @@
 {% block content %}
 <header class="container">
     <hgroup>
-        <h1>@{{ user.screen_name }}'s feed</h1>
+        <h1>@{{ user.screen_name }}'s {{ page.as_str() }} feed</h1>
         {% match last_updated %}
         {% when Some with (last_updated) %}
         <h2>
@@ -19,15 +19,33 @@
         {% endmatch %}
     </hgroup>
 
-    <a href="/export/csv" role="button" class="outline">export csv</a>
-    <a href="/export/ff" role="button" class="outline">export friends and followers</a>
-    <a href="#" role="button" class="delete outline" id="delete-account" data-tooltip="remove follower history, does not affect twitter">delete saved data</a>
+    <p>
+        {% if track_opts.followers && track_opts.following %}
+            {% match page %}
+            {% when FeedPage::Followers %}
+            <a href="/feed?page=following">view following feed</a>
+            {% when FeedPage::Following %}
+            <a href="/feed?page=followers">view follower feed</a>
+            {% endmatch %}
+        {% endif %}
+    </p>
+
+    <p>
+        <a href="/export/csv" role="button" class="outline">export csv</a>
+        <a href="/export/ff" role="button" class="outline">export friends and followers</a>
+        <a href="#" role="button" class="delete outline" id="delete-account" data-tooltip="remove tracked history, does not affect twitter">delete saved data</a>
+    </p>
 </header>
 
 <main class="container" data-page="feed">
     {% if events.is_empty() %}
-    <p>no events found yet. please reload in a minute.</p>
+    {% if !track_opts.followers && !track_opts.following %}
+    <p>not tracking anything.</p>
     {% else %}
+    <p>no events found yet. please reload in a minute.</p>
+    {% endif %}
+    {% else %}
+
     <table>
         <thead>
             <tr>

@@ -18,6 +18,7 @@ use clap::Parser;
 use futures::{Future, StreamExt, TryFutureExt, TryStreamExt};
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
+use sqlx::Connection;
 use tokio::io::AsyncWriteExt;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tracing::Instrument;
@@ -174,40 +175,101 @@ async fn refresh_account(
     pool: sqlx::PgPool,
     user_id: u64,
     token: egg_mode::Token,
+    track_opts: TrackOptions,
 ) -> Result<i64, AppError> {
     let mut tx = pool.begin().await?;
 
-    let existing_follower_ids = sqlx::query!(
-        "SELECT follower_ids FROM twitter_state WHERE login_twitter_account_id = $1 ORDER BY created_at DESC LIMIT 1",
-        i64::try_from(user_id).unwrap()
-    )
-    .map(|row| row.follower_ids.into_iter().filter_map(|id| u64::try_from(id).ok()).collect::<Vec<_>>())
-    .fetch_optional(&mut tx).await?.unwrap_or_default();
-    let existing_follower_ids: HashSet<u64> = HashSet::from_iter(existing_follower_ids);
-    tracing::debug!(
-        "found {} existing follower ids",
-        existing_follower_ids.len()
-    );
+    if track_opts.followers {
+        tracing::info!("updating followers");
 
-    let current_follower_ids = egg_mode::user::followers_ids(user_id, &token)
-        .with_page_size(5000)
-        .map_ok(|r| r.response)
-        .try_collect::<Vec<_>>()
+        let current_follower_ids = egg_mode::user::followers_ids(user_id, &token)
+            .with_page_size(5000)
+            .map_ok(|r| r.response)
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let tx = tx.begin().await?;
+        let tx =
+            update_account_tracking(&pool, tx, user_id, current_follower_ids, &token, "follower")
+                .await?;
+        tx.commit().await?;
+    }
+
+    if track_opts.following {
+        tracing::info!("updating following");
+
+        let current_following_ids = egg_mode::user::friends_ids(user_id, &token)
+            .with_page_size(5000)
+            .map_ok(|r| r.response)
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let tx = tx.begin().await?;
+        let tx = update_account_tracking(
+            &pool,
+            tx,
+            user_id,
+            current_following_ids,
+            &token,
+            "following",
+        )
         .await?;
-    tracing::debug!("found {} new follower ids", current_follower_ids.len());
-    let current_follower_i64s = current_follower_ids
-        .iter()
-        .filter_map(|id| i64::try_from(*id).ok())
-        .collect::<Vec<_>>();
+        tx.commit().await?;
+    }
+
     sqlx::query!(
-        "INSERT INTO twitter_state (login_twitter_account_id, follower_ids) VALUES ($1, $2)",
-        i64::try_from(user_id).unwrap(),
-        &current_follower_i64s
+        "UPDATE twitter_login SET last_updated = current_timestamp WHERE twitter_account_id = $1",
+        i64::try_from(user_id).unwrap()
     )
     .execute(&mut tx)
     .await?;
 
-    let unknown_ids = find_unknown_ids(&pool, &current_follower_i64s).await?;
+    tx.commit().await?;
+
+    Ok(i64::try_from(user_id).unwrap())
+}
+
+async fn update_account_tracking<'a>(
+    pool: &sqlx::PgPool,
+    mut tx: sqlx::Transaction<'a, sqlx::Postgres>,
+    user_id: u64,
+    current_ids: Vec<u64>,
+    token: &egg_mode::Token,
+    tracking: &str,
+) -> Result<sqlx::Transaction<'a, sqlx::Postgres>, AppError> {
+    let existing_ids = sqlx::query!(
+        "SELECT account_ids FROM twitter_state WHERE login_twitter_account_id = $1 AND tracking = $2 ORDER BY created_at DESC LIMIT 1",
+        i64::try_from(user_id).unwrap(),
+        tracking,
+    )
+    .map(|row| {
+        row
+            .account_ids
+            .into_iter()
+            .filter_map(|id| u64::try_from(id).ok())
+            .collect::<Vec<_>>()
+    })
+    .fetch_optional(&mut tx)
+    .await?
+    .unwrap_or_default();
+    let existing_ids: HashSet<u64> = HashSet::from_iter(existing_ids);
+    tracing::debug!("found {} existing ids", existing_ids.len());
+
+    tracing::debug!("found {} new ids", current_ids.len());
+    let current_i64s = current_ids
+        .iter()
+        .filter_map(|id| i64::try_from(*id).ok())
+        .collect::<Vec<_>>();
+    sqlx::query!(
+        "INSERT INTO twitter_state (login_twitter_account_id, account_ids, tracking) VALUES ($1, $2, $3)",
+        i64::try_from(user_id).unwrap(),
+        &current_i64s,
+        tracking,
+    )
+    .execute(&mut tx)
+    .await?;
+
+    let unknown_ids = find_unknown_ids(&pool, &current_i64s).await?;
     for chunk in unknown_ids.chunks(100) {
         tracing::debug!("looking up batch of {} users", chunk.len());
 
@@ -219,15 +281,22 @@ async fn refresh_account(
         let mut tx = pool.begin().await?;
         for resp in accounts {
             let account = resp.response;
-            sqlx::query!("INSERT INTO twitter_account (id, screen_name, display_name) VALUES ($1, $2, $3) ON CONFLICT (id) DO UPDATE SET last_updated = current_timestamp, screen_name = EXCLUDED.screen_name, display_name = EXCLUDED.display_name", i64::try_from(account.id).unwrap(), account.screen_name, account.name).execute(&mut tx).await?;
+            sqlx::query!(
+                "INSERT INTO twitter_account (id, screen_name, display_name) VALUES ($1, $2, $3) ON CONFLICT (id) DO UPDATE SET last_updated = current_timestamp, screen_name = EXCLUDED.screen_name, display_name = EXCLUDED.display_name",
+                i64::try_from(account.id).unwrap(),
+                account.screen_name,
+                account.name
+            )
+            .execute(&mut tx)
+            .await?;
         }
         tx.commit().await?;
     }
 
-    let current_follower_ids: HashSet<u64> = HashSet::from_iter(current_follower_ids);
+    let current_ids: HashSet<u64> = HashSet::from_iter(current_ids);
 
-    let new_unfollower_ids = existing_follower_ids.difference(&current_follower_ids);
-    let new_follower_ids = current_follower_ids.difference(&existing_follower_ids);
+    let new_unfollower_ids = existing_ids.difference(&current_ids);
+    let new_follower_ids = current_ids.difference(&existing_ids);
 
     let events: Vec<_> = new_unfollower_ids
         .map(|id| (*id, "unfollow"))
@@ -245,31 +314,24 @@ async fn refresh_account(
 
         sqlx::query!(
             "INSERT INTO twitter_event
-                (login_twitter_account_id, related_twitter_account_id, event_name)
+                (login_twitter_account_id, related_twitter_account_id, event_name, tracking)
             SELECT
                 event.login_twitter_account_id,
                 event.related_twitter_account_id,
-                event.event
+                event.event,
+                $2
             FROM jsonb_to_recordset($1) AS
                 event(login_twitter_account_id bigint, related_twitter_account_id bigint, event text)
             JOIN twitter_account
                 ON twitter_account.id = event.login_twitter_account_id",
-            data
+            data,
+            tracking,
         )
         .execute(&mut tx)
         .await?;
     }
 
-    sqlx::query!(
-        "UPDATE twitter_login SET last_updated = current_timestamp WHERE twitter_account_id = $1",
-        i64::try_from(user_id).unwrap()
-    )
-    .execute(&mut tx)
-    .await?;
-
-    tx.commit().await?;
-
-    Ok(i64::try_from(user_id).unwrap())
+    Ok(tx)
 }
 
 async fn find_unknown_ids(pool: &sqlx::PgPool, given_ids: &[i64]) -> Result<Vec<i64>, AppError> {
@@ -281,6 +343,7 @@ async fn find_unknown_ids(pool: &sqlx::PgPool, given_ids: &[i64]) -> Result<Vec<
         .copied()
         .filter(|given_id| !existing_ids.contains(given_id))
         .collect();
+
     Ok(new_ids)
 }
 
@@ -299,24 +362,32 @@ async fn refresh_stale_accounts(pool: sqlx::PgPool, kp: egg_mode::KeyPair) {
 }
 
 async fn refresh_accounts(pool: &sqlx::PgPool, kp: &egg_mode::KeyPair) -> Result<(), AppError> {
-    let old_accounts = sqlx::query!("SELECT twitter_account_id, consumer_key, consumer_secret FROM twitter_login WHERE last_updated IS NULL OR last_updated < now() - interval '6 hours' AND error_count < 10 LIMIT 100").fetch_all(pool).await?;
+    let old_accounts = sqlx::query!("SELECT twitter_account_id, consumer_key, consumer_secret, track_followers, track_following FROM twitter_login WHERE last_updated IS NULL OR last_updated < now() - interval '6 hours' AND error_count < 10 LIMIT 100").fetch_all(pool).await?;
     tracing::info!("found {} accounts needing update", old_accounts.len());
 
     let tokens = old_accounts.into_iter().map(|row| {
-        (row.twitter_account_id, {
-            let access = egg_mode::KeyPair::new(row.consumer_key, row.consumer_secret);
-            egg_mode::Token::Access {
-                consumer: kp.clone(),
-                access,
-            }
-        })
+        (
+            row.twitter_account_id,
+            TrackOptions {
+                followers: row.track_followers,
+                following: row.track_following,
+            },
+            {
+                let access = egg_mode::KeyPair::new(row.consumer_key, row.consumer_secret);
+                egg_mode::Token::Access {
+                    consumer: kp.clone(),
+                    access,
+                }
+            },
+        )
     });
 
-    let mut futs = futures::stream::iter(tokens.map(|(twitter_account_id, token)| {
+    let mut futs = futures::stream::iter(tokens.map(|(twitter_account_id, opts, token)| {
         refresh_account(
             pool.clone(),
             u64::try_from(twitter_account_id).unwrap(),
             token,
+            opts,
         )
         .map_err(move |err| (err, twitter_account_id))
     }))
@@ -385,6 +456,8 @@ struct LoginForm {
     use_json: Option<String>,
     export_bookmarks: Option<String>,
     download_profile_pictures: Option<String>,
+    track_followers: Option<String>,
+    track_following: Option<String>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -392,6 +465,12 @@ struct ExportOptions {
     json: bool,
     bookmarks: bool,
     profile_pictures: bool,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct TrackOptions {
+    following: bool,
+    followers: bool,
 }
 
 #[post("/twitter/login")]
@@ -430,6 +509,13 @@ async fn twitter_login(
 
         url.as_str().to_string()
     } else {
+        let track_options = TrackOptions {
+            followers: matches!(&form.track_followers, Some(val) if val == "on"),
+            following: matches!(&form.track_following, Some(val) if val == "on"),
+        };
+
+        sess.insert("track-options", track_options)?;
+
         let request_token = egg_mode::auth::request_token(
             &cx.kp,
             format!("{}/twitter/callback", cx.config.host_url),
@@ -472,6 +558,8 @@ async fn twitter_callback(
         .get("twitter-request-token")?
         .ok_or_else(|| actix_web::error::ErrorBadRequest("missing session data"))?;
 
+    let opts: TrackOptions = sess.get("track-options")?.unwrap_or_default();
+
     let (token, user_id, _screen_name) =
         egg_mode::auth::access_token(cx.kp.clone(), &request_token, &query.oauth_verifier)
             .await
@@ -498,17 +586,19 @@ async fn twitter_callback(
     ).execute(&cx.pool).await.map_err(actix_web::error::ErrorInternalServerError)?;
 
     sqlx::query!(
-        "INSERT INTO twitter_login (twitter_account_id, consumer_key, consumer_secret) VALUES ($1, $2, $3) ON CONFLICT (twitter_account_id) DO UPDATE SET consumer_key = EXCLUDED.consumer_key, consumer_secret = EXCLUDED.consumer_secret, error_count = 0",
+        "INSERT INTO twitter_login (twitter_account_id, consumer_key, consumer_secret, track_followers, track_following) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (twitter_account_id) DO UPDATE SET consumer_key = EXCLUDED.consumer_key, consumer_secret = EXCLUDED.consumer_secret, error_count = 0",
         i64::try_from(account.id).unwrap(),
         user_kp.key.as_ref(),
-        user_kp.secret.as_ref()
+        user_kp.secret.as_ref(),
+        opts.followers,
+        opts.following,
     ).execute(&cx.pool).await.map_err(actix_web::error::ErrorInternalServerError)?;
 
     sess.insert("twitter-user-id", user_id)?;
     sess.insert("csrf-token", generate_token(48))?;
 
     tokio::task::spawn(async move {
-        if let Err(err) = refresh_account(cx.pool.clone(), user_id, token).await {
+        if let Err(err) = refresh_account(cx.pool.clone(), user_id, token, opts).await {
             tracing::error!("could not refresh account: {err}");
         }
     });
@@ -1457,6 +1547,7 @@ impl std::fmt::Display for TwitterEvent {
 
 #[derive(Debug)]
 struct TwitterEventEntry {
+    tracking: String,
     user: TwitterUser,
     event: TwitterEvent,
     created_at: chrono::DateTime<chrono::Utc>,
@@ -1469,10 +1560,37 @@ struct FeedTemplate {
     events: Vec<TwitterEventEntry>,
     last_updated: Option<chrono::DateTime<chrono::Utc>>,
     csrf_token: String,
+    track_opts: TrackOptions,
+    page: FeedPage,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+enum FeedPage {
+    Followers,
+    Following,
+}
+
+impl FeedPage {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Followers => "follower",
+            Self::Following => "following",
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct FeedQuery {
+    page: Option<FeedPage>,
 }
 
 #[get("/feed")]
-async fn feed(cx: web::Data<Context>, sess: Session) -> Result<HttpResponse, actix_web::Error> {
+async fn feed(
+    cx: web::Data<Context>,
+    query: web::Query<FeedQuery>,
+    sess: Session,
+) -> Result<HttpResponse, actix_web::Error> {
     let Some(user_id) = sess
         .get::<i64>("twitter-user-id")? else {
             return Ok(HttpResponse::Found().insert_header(("location", "/")).finish())
@@ -1492,7 +1610,32 @@ async fn feed(cx: web::Data<Context>, sess: Session) -> Result<HttpResponse, act
     .await
     .map_err(actix_web::error::ErrorInternalServerError)?;
 
-    let events = sqlx::query!("SELECT twitter_event.created_at, twitter_event.event_name, twitter_account.id, twitter_account.screen_name, twitter_account.display_name FROM twitter_event JOIN twitter_account ON twitter_account.id = twitter_event.related_twitter_account_id WHERE login_twitter_account_id = $1 ORDER BY created_at DESC LIMIT 5000", user_id).map(|row| TwitterEventEntry {
+    let track_opts = sqlx::query!(
+        "SELECT track_followers, track_following FROM twitter_login WHERE twitter_account_id = $1",
+        user_id
+    )
+    .map(|row| TrackOptions {
+        followers: row.track_followers,
+        following: row.track_following,
+    })
+    .fetch_one(&cx.pool)
+    .await
+    .map_err(actix_web::error::ErrorInternalServerError)?;
+
+    let page = match query.page {
+        Some(page) => page,
+        None if track_opts.followers => FeedPage::Followers,
+        None if track_opts.following => FeedPage::Following,
+        None => FeedPage::Followers,
+    };
+
+    let events = sqlx::query!(
+        "SELECT twitter_event.created_at, twitter_event.event_name, twitter_event.tracking, twitter_account.id, twitter_account.screen_name, twitter_account.display_name FROM twitter_event JOIN twitter_account ON twitter_account.id = twitter_event.related_twitter_account_id WHERE login_twitter_account_id = $1 AND tracking = $2 ORDER BY created_at DESC LIMIT 5000",
+        user_id,
+        page.as_str(),
+    )
+    .map(|row| TwitterEventEntry {
+        tracking: row.tracking,
         user: TwitterUser {
             id: row.id,
             screen_name: row.screen_name,
@@ -1520,6 +1663,8 @@ async fn feed(cx: web::Data<Context>, sess: Session) -> Result<HttpResponse, act
         events,
         last_updated,
         csrf_token,
+        track_opts,
+        page,
     }
     .render()
     .map_err(actix_web::error::ErrorInternalServerError)?;
@@ -1536,10 +1681,10 @@ async fn feed_graph(
         .ok_or_else(|| actix_web::error::ErrorUnauthorized("missing id"))?;
 
     let entries = sqlx::query!(
-        "SELECT created_at, follower_count FROM twitter_state WHERE login_twitter_account_id = $1 ORDER BY created_at LIMIT 100",
+        "SELECT created_at, account_count FROM twitter_state WHERE login_twitter_account_id = $1 ORDER BY created_at LIMIT 100",
         user_id
     )
-    .map(|row| (row.created_at.timestamp(), row.follower_count))
+    .map(|row| (row.created_at.timestamp(), row.account_count))
     .fetch_all(&cx.pool)
     .await
     .map_err(actix_web::error::ErrorInternalServerError)?;
@@ -1561,7 +1706,8 @@ async fn export_csv(
     let (tx, rx) = tokio::sync::mpsc::channel(4);
 
     tokio::task::spawn(async move {
-        let mut events = sqlx::query!("SELECT twitter_event.created_at, twitter_event.event_name, twitter_account.id, twitter_account.screen_name, twitter_account.display_name FROM twitter_event JOIN twitter_account ON twitter_account.id = twitter_event.related_twitter_account_id WHERE login_twitter_account_id = $1 ORDER BY created_at", user_id).map(|row| TwitterEventEntry {
+        let mut events = sqlx::query!("SELECT twitter_event.created_at, twitter_event.event_name, twitter_event.tracking, twitter_account.id, twitter_account.screen_name, twitter_account.display_name FROM twitter_event JOIN twitter_account ON twitter_account.id = twitter_event.related_twitter_account_id WHERE login_twitter_account_id = $1 ORDER BY created_at", user_id).map(|row| TwitterEventEntry {
+            tracking: row.tracking,
             user: TwitterUser {
                 id: row.id,
                 screen_name: row.screen_name,
@@ -1582,8 +1728,9 @@ async fn export_csv(
 
     let stream = tokio_stream::wrappers::ReceiverStream::from(rx).map(|event| {
         Ok::<_, std::convert::Infallible>(Bytes::from(format!(
-            "{},{},{},{}\n",
+            "{},{},{},{},{}\n",
             event.created_at.to_rfc3339(),
+            event.tracking,
             event.event,
             event.user.id,
             event.user.screen_name
