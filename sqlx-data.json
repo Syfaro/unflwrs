@@ -84,19 +84,6 @@
     },
     "query": "UPDATE twitter_login SET last_updated = current_timestamp WHERE twitter_account_id = $1"
   },
-  "5d14b1381738eb2f52073eb12f1233662a1368b7f1555e47b7a16d178666fe0b": {
-    "describe": {
-      "columns": [],
-      "nullable": [],
-      "parameters": {
-        "Left": [
-          "Jsonb",
-          "Text"
-        ]
-      }
-    },
-    "query": "INSERT INTO twitter_event\n                (login_twitter_account_id, related_twitter_account_id, event_name, tracking)\n            SELECT\n                event.login_twitter_account_id,\n                event.related_twitter_account_id,\n                event.event,\n                $2\n            FROM jsonb_to_recordset($1) AS\n                event(login_twitter_account_id bigint, related_twitter_account_id bigint, event text)\n            JOIN twitter_account\n                ON twitter_account.id = event.login_twitter_account_id"
-  },
   "6faaab395cb6394924c9c5feb34bc32ed34e39ff2e2b529eca55695788869b75": {
     "describe": {
       "columns": [],
@@ -261,6 +248,19 @@
       }
     },
     "query": "SELECT twitter_event.created_at, twitter_event.event_name, twitter_event.tracking, twitter_account.id, twitter_account.screen_name, twitter_account.display_name FROM twitter_event JOIN twitter_account ON twitter_account.id = twitter_event.related_twitter_account_id WHERE login_twitter_account_id = $1 AND tracking = $2 ORDER BY created_at DESC LIMIT 5000"
+  },
+  "9e15d890ca7899dd647980d3b5148867004387655ce85ba17d9b079dbd58d7f3": {
+    "describe": {
+      "columns": [],
+      "nullable": [],
+      "parameters": {
+        "Left": [
+          "Jsonb",
+          "Text"
+        ]
+      }
+    },
+    "query": "INSERT INTO twitter_event\n                (login_twitter_account_id, related_twitter_account_id, event_name, tracking)\n            SELECT\n                event.login_twitter_account_id,\n                event.related_twitter_account_id,\n                event.event,\n                $2\n            FROM jsonb_to_recordset($1) AS\n                event(login_twitter_account_id bigint, related_twitter_account_id bigint, event text)\n            JOIN twitter_account\n                ON twitter_account.id = event.related_twitter_account_id"
   },
   "d09f1905537d359dc37e4c1b73892b8e2160230ecac94453796a3ce837c7ff56": {
     "describe": {

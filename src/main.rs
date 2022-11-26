@@ -323,7 +323,7 @@ async fn update_account_tracking<'a>(
             FROM jsonb_to_recordset($1) AS
                 event(login_twitter_account_id bigint, related_twitter_account_id bigint, event text)
             JOIN twitter_account
-                ON twitter_account.id = event.login_twitter_account_id",
+                ON twitter_account.id = event.related_twitter_account_id",
             data,
             tracking,
         )
