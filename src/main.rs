@@ -12,7 +12,6 @@ use actix_web::{
     post, web, App, HttpResponse, HttpResponseBuilder, HttpServer,
 };
 use askama::Template;
-use async_zip::ZipEntryBuilderExt;
 use bytes::Bytes;
 use clap::Parser;
 use futures::{Future, StreamExt, TryFutureExt, TryStreamExt};
@@ -269,14 +268,14 @@ async fn update_account_tracking<'a>(
     .execute(&mut tx)
     .await?;
 
-    let unknown_ids = find_unknown_ids(&pool, &current_i64s).await?;
+    let unknown_ids = find_unknown_ids(pool, &current_i64s).await?;
     for chunk in unknown_ids.chunks(100) {
         tracing::debug!("looking up batch of {} users", chunk.len());
 
         let ids = chunk
             .iter()
             .map(|id| egg_mode::user::UserID::ID(u64::try_from(*id).unwrap()));
-        let accounts = egg_mode::user::lookup(ids, &token).await?;
+        let accounts = egg_mode::user::lookup(ids, token).await?;
 
         let mut tx = pool.begin().await?;
         for resp in accounts {
@@ -641,7 +640,7 @@ async fn twitter_callback_v2(
         .await
         .map_err(actix_web::error::ErrorInternalServerError)?;
 
-    sess.insert("twitter-v2-token", &token)?;
+    sess.insert("twitter-v2-token", token)?;
     sess.insert("csrf-token", generate_token(48))?;
 
     let body = ExportTemplate
